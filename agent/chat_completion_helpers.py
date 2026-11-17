@@ -1310,6 +1310,9 @@ def _reasoning_config_for_wire(agent):
         # route's own, recorded below as what went out so a rejection of it lands in the branch above.
         from agent.reasoning_params import unset_reasoning_default
         cfg = unset_reasoning_default(agent)
+        if cfg is not None:
+            from agent.adaptive_reasoning import reasoning_for_turn
+            cfg = reasoning_for_turn(agent) or cfg
     if getattr(agent, "_reasoning_disable_rejected", False):
         # The route rejects disables. Resend exactly what the session has
         # been sending — the user's own config — so the retry lands on the
