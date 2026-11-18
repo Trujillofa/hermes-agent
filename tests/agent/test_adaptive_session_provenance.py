@@ -82,6 +82,48 @@ def test_unmodified_fallback_restores_primary_profile_provenance():
     assert agent.reasoning_config == primary
 
 
+@pytest.mark.parametrize('fresh', ['medium', 'low', None, 'disabled'])
+def test_cached_gateway_turn_setting_survives_fallback_restoration(fresh):
+    from tests.gateway.test_display_null_turn_wiring import _wire
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    primary = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    config = {'agent': {'reasoning_effort': 'medium'}}
+    with adaptive_turn(agent, 'complex task', [], True), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=config):
+        assert agent._try_activate_fallback()
+        assert agent.reasoning_config['effort'] == 'medium'
+    if fresh == 'disabled':
+        value = {'enabled': False}
+    elif fresh is None:
+        value = None
+    else:
+        value = resolve_reasoning_config({'agent': {'reasoning_effort': fresh}}, 'gpt-6.1-terra')
+    _wire({}, agent=agent, reasoning_config=value)
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == value
+    assert type(agent.reasoning_config) is type(value)
+
+
+@pytest.mark.parametrize('following', [False, True])
+def test_gateway_loader_passes_effective_model_to_local_policy(tmp_path, following):
+    from types import SimpleNamespace
+    from gateway.run_config_loaders import GatewayConfigLoadersMixin
+    config = {'model': {'default': 'model-a', 'provider': 'openrouter'},
+              'agent': {'reasoning_effort': 'medium',
+                        'reasoning_overrides': {'model-a': 'high', 'model-b': 'low'}}}
+    policy = build_policy({'source': 'cli', 'cwd': str(tmp_path), 'model': 'model-a',
+                           'follow_profile_config': following}, config, profile_terminal=False)
+    runner = SimpleNamespace(_resolve_session_key_or_none=lambda *_: 'route',
+                             _peek_session_state=lambda *_: None)
+    with patch('gateway.session_setting_commands.local_policy', return_value=policy), \
+         patch('gateway.session_authorities.active_authority', return_value=None):
+        resolved = GatewayConfigLoadersMixin._resolve_session_reasoning_config(runner, model='model-b')
+    assert resolved['effort'] == 'low'
+
+
 @pytest.mark.parametrize('before_fallback', [False, True])
 def test_edit_survives_multiple_fallbacks(before_fallback):
     from agent.route_binding import bind_route_entry
@@ -160,6 +202,22 @@ def test_disabled_fallback_matches_legacy_reresolution(explicit):
         assert agent._try_activate_fallback()
     assert agent.reasoning_config == {'enabled': True, 'effort': 'medium'}
     assert '_fallback_reasoning_at_bind' not in vars(agent)
+
+
+def test_disabled_cached_gateway_fallback_retains_legacy_restoration():
+    from tests.gateway.test_display_null_turn_wiring import _wire
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    primary = {'enabled': True, 'effort': 'high'}
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    with adaptive_turn(agent, 'hi', [], False), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'medium'}}):
+        assert agent._try_activate_fallback()
+    _wire({}, agent=agent, reasoning_config={'enabled': False})
+    assert '_fallback_reasoning_session_edit' not in vars(agent)
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == primary
 
 
 @pytest.mark.parametrize('following', [False, True])
