@@ -7,6 +7,7 @@ is the inverse that ``restore_primary_runtime`` runs once its gates pass.
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
@@ -92,6 +93,17 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     from agent.route_verdicts import reset_route_verdicts, save_primary_route_verdicts
     save_primary_route_verdicts(agent)  # before the swap: stamped with the endpoint that earned them
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+    prior = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
+    current = getattr(agent, "reasoning_config", None)
+    if prior is not _NO_REASONING_MARKER and (type(current) is not type(prior) or current != prior):
+        agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
+    elif prior is _NO_REASONING_MARKER:
+        from hermes_constants import ProfileReasoningConfig
+        saved = (getattr(agent, "_primary_runtime", None) or {}).get("reasoning_config")
+        explicit = current is not None and not (
+            isinstance(current, ProfileReasoningConfig) and current.is_baseline())
+        if explicit and saved is not None and (type(current) is not type(saved) or current != saved):
+            agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
     agent._config_context_length = None
@@ -121,6 +133,9 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
     _update_fallback_context_compressor(agent)
     _reresolve_fallback_reasoning_config(agent)
+    # Record what the fallback itself installed, not the primary's snapshot. A later
+    # session edit must not be overwritten when the primary route comes back.
+    agent._fallback_reasoning_at_bind = copy.deepcopy(getattr(agent, "reasoning_config", None))
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     if commit_pool_choice and choice is not None:
         choice.commit()
@@ -161,7 +176,6 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     # Older snapshots have no reasoning_config; keep the current value.
     saved_reasoning = rt.get("reasoning_config")
     if saved_reasoning is not None:
-        import copy
         agent.reasoning_config = copy.deepcopy(saved_reasoning)
     # Reset the stale-call circuit breaker: its streak measured the route being left.
     from agent.chat_completion_helpers import _reset_stale_streak, rewrite_prompt_model_identity
@@ -177,7 +191,17 @@ def reinstall_primary_runtime(
 ) -> None:
     """Put ``agent`` back on its ``_primary_runtime`` snapshot ``rt`` and clear the fallback state."""
     from agent.agent_runtime_helpers import _rebind_primary_credential_pool
+    marker = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
+    current = getattr(agent, "reasoning_config", None)
+    changed = marker is not _NO_REASONING_MARKER and (type(current) is not type(marker) or current != marker)
+    edit = (current,) if changed else vars(agent).get("_fallback_reasoning_session_edit")
+    if edit is not None:
+        current = copy.deepcopy(edit[0])
     reinstall_runtime_snapshot(agent, rt)
+    if edit is not None:
+        agent.reasoning_config = current
+    vars(agent).pop("_fallback_reasoning_at_bind", None)
+    vars(agent).pop("_fallback_reasoning_session_edit", None)
     _rebind_primary_credential_pool(
         agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
     )
@@ -186,3 +210,6 @@ def reinstall_primary_runtime(
     agent._fallback_activated = False
     agent._fallback_index = 0
     agent._rate_limit_backoff_count = 0
+
+
+_NO_REASONING_MARKER = object()

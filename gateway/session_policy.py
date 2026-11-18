@@ -286,9 +286,15 @@ class LocalSessionPolicy:
         if not self.follows_profile:
             return self.reasoning_config
         from gateway.session_authorities import active_authority
-        from hermes_constants import resolve_reasoning_config
         config, model = self.effective(active_authority(runner), secrets=False)
-        return resolve_reasoning_config(config, model or '')
+        return self._session_reasoning(config, model)
+
+    def _session_reasoning(self, config, model):
+        from hermes_constants import resolve_reasoning_config
+        resolved = resolve_reasoning_config(config, model or '')
+        pinned = session_pinned(config, 'reasoning', 'reasoning' in json.loads(self.request_json))
+        # The effective config includes session pins; they are not profile defaults.
+        return dict(resolved) if pinned and resolved is not None else resolved
 
     def current_service_tier(self, runner, session_key):
         """The next turn's tier: a typed session /fast, else the policy's (frozen, or the profile's when following)."""
@@ -354,8 +360,7 @@ class LocalSessionPolicy:
 
     @property
     def reasoning_config(self):
-        from hermes_constants import resolve_reasoning_config
-        return resolve_reasoning_config(self.config(), self.model or '')
+        return self._session_reasoning(self.config(), self.model)
 
 
 def profile_target(config):
