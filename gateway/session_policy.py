@@ -73,13 +73,14 @@ def unpin_reasoning(config, profile):
     config[SESSION_PINS] = {**(config.get(SESSION_PINS) or {}), 'reasoning': False}
 
 
-FOLLOW_AGENT_KEYS = ('reasoning_effort', 'reasoning_overrides', 'service_tier', 'disabled_toolsets', 'coding_context')
+FOLLOW_AGENT_KEYS = ('reasoning_effort', 'reasoning_overrides', 'adaptive_reasoning', 'service_tier', 'disabled_toolsets', 'coding_context')
 # What a pick (create-time ``model`` / committed ``/model``) owns of the ``model:`` block.
 SELECTION_KEYS = ('default', 'provider', 'base_url', 'api_mode', 'selection_profile', 'api_key_from', 'key_env',
                   'api_key_env')
 BYPASS_FIELDS = ('safe_mode', 'ignore_user_config')
 _ACTIVE_POLICY: ContextVar = ContextVar('local_session_policy', default=None)
 _TURN_PROFILE: ContextVar = ContextVar('follow_profile_read', default=None)  # (policy, live) for a turn
+_TURN_POLICY_AUTHORITY: ContextVar = ContextVar('turn_policy_authority', default=None)
 # Creation label -> agent surface. ``tool`` (third-party integrations, ``hermes chat --source tool``) and
 # ``oneshot`` (finite ``chat -q`` / ``-z`` runs) run as the CLI but keep their own stored label, so human
 # pickers hide them (INTERNAL_LISTING_SOURCES).
@@ -1186,6 +1187,7 @@ def policy_scope(policy, *, authority=None, home=None):
     owner = home if home is not None else getattr(authority, 'profile_id', None)
     terminal_token = bind_terminal_policy(terminal, profile_home=owner)
     policy_token = _ACTIVE_POLICY.set(active)
+    authority_token = _TURN_POLICY_AUTHORITY.set(authority)
     from gateway.session_local_editor import editor_scope
     try:
         from agent.auxiliary_task_config import session_auxiliary_scope
@@ -1198,6 +1200,7 @@ def policy_scope(policy, *, authority=None, home=None):
               policy.client_env_scope()):
             yield
     finally:
+        _TURN_POLICY_AUTHORITY.reset(authority_token)
         _ACTIVE_POLICY.reset(policy_token)
         reset_terminal_scope(terminal_token)
         cwd_token.var.reset(cwd_token)
@@ -1283,3 +1286,26 @@ def active_policy():
     """The frozen launch policy of the turn executing in this context, or ``None`` (standalone
     serve / messaging turns). Consumers read it instead of re-deriving from live config."""
     return _ACTIVE_POLICY.get()
+
+
+def active_policy_config():
+    """Effective config for the bound turn, or None when there is no policy.
+
+    Resolve against the original policy held by the scope, not its toolset-adjusted
+    copy, so following sessions reuse the same owning-profile read as the turn.
+    """
+    if _ACTIVE_POLICY.get() is None:
+        return None
+    held = _TURN_PROFILE.get()
+    if held is None:
+        raise RuntimeError('active session policy has no turn profile binding')
+    policy = held[0]
+    authority = _TURN_POLICY_AUTHORITY.get()
+    if policy.followed_sections and authority is None:
+        # Managed workers bind a hydrated, frozen config before importing runtime.
+        from agent.safe_worker_policy import worker_config_snapshot
+        if worker_config_snapshot() is None:
+            raise RuntimeError('following session policy has no owning authority')
+    elif policy.followed_sections and not held[1]:
+        raise RuntimeError('following session policy has no resolved profile config')
+    return policy.config(authority, secrets=False)

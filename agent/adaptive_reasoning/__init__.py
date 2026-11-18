@@ -23,15 +23,18 @@ def classify(message, history):
 
 
 def enabled_for_turn(override):
-    """An explicit per-call boolean wins; otherwise read the active profile each turn.
+    """An explicit per-call boolean wins; otherwise use the effective turn policy.
 
     Only a literal boolean enables the feature. Bad/missing config fails closed.
     """
     if override is not None:
         return override is True
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from gateway.session_policy import active_policy_config
+        config = active_policy_config()
+        if config is None:
+            from hermes_cli.config import load_config
+            config = load_config()
         return config.get("agent", {}).get("adaptive_reasoning") is True
     except Exception:
         return False
