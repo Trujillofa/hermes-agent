@@ -24,6 +24,8 @@ from agent.route_verdicts import ROUTE_VERDICT_FIELDS
 logger = logging.getLogger(__name__)
 
 TASK = "voice_chat"
+_MISSING = object()
+_REASONING_FIELDS = ("_fallback_reasoning_at_bind", "_fallback_reasoning_primary", "_fallback_reasoning_session_edit")
 
 # Agent fields the route swap touches outside the ``_primary_runtime``-shaped snapshot. The
 # rejection verdicts are facts about one route: binding the voice route clears them (route_verdicts)
@@ -109,6 +111,8 @@ def _capture(agent: Any) -> dict[str, Any]:
     from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
     return {
         "snapshot": _build_primary_runtime_snapshot(agent, agent.api_mode),
+        "reasoning_markers": {name: copy.deepcopy(vars(agent)[name]) if name in vars(agent) else _MISSING
+                              for name in _REASONING_FIELDS},
         **{name: getattr(agent, name, None) for name in _EXTRA_FIELDS},
     }
 
@@ -118,6 +122,11 @@ def _reinstall(agent: Any, state: dict[str, Any]) -> None:
     reinstall_runtime_snapshot(agent, state["snapshot"])
     for name in _EXTRA_FIELDS:
         setattr(agent, name, state[name])
+    for name, value in state["reasoning_markers"].items():
+        if value is _MISSING:
+            vars(agent).pop(name, None)
+        else:
+            setattr(agent, name, value)
 
 
 def _warn_once(agent: Any, target: dict[str, Any], reason: str) -> None:

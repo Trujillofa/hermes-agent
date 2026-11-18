@@ -53,11 +53,10 @@ def test_committed_pin_and_reset_provenance(tmp_path, following):
 
 
 @pytest.mark.parametrize('new_value', [{'enabled': False}, {'enabled': True, 'effort': 'low'}, None, {}])
-@pytest.mark.parametrize('enabled', [False, True])
-def test_edit_during_fallback_survives_restore(new_value, enabled):
+def test_edit_during_fallback_survives_restore(new_value):
     agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'anthropic/claude-sonnet-4'})
     agent._primary_runtime['reasoning_config'] = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
-    with adaptive_turn(agent, 'hi', [], enabled), \
+    with adaptive_turn(agent, 'hi', [], True), \
          patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
          patch('hermes_cli.config.load_config', return_value=PROFILE):
         assert agent._try_activate_fallback()
@@ -71,7 +70,9 @@ def test_unmodified_fallback_restores_primary_profile_provenance():
     agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'anthropic/claude-sonnet-4'})
     primary = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
     agent._primary_runtime['reasoning_config'] = primary
-    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+    agent.reasoning_config = primary
+    with adaptive_turn(agent, 'complex task', [], True), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
          patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'medium'}}):
         assert agent._try_activate_fallback()
         assert agent.reasoning_config['effort'] == 'medium'
@@ -88,7 +89,8 @@ def test_edit_survives_multiple_fallbacks(before_fallback):
     agent._primary_runtime['reasoning_config'] = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
     if before_fallback:
         agent.reasoning_config = {'enabled': False}
-    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+    with adaptive_turn(agent, 'hi', [], True), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
          patch('hermes_cli.config.load_config', return_value=PROFILE):
         assert agent._try_activate_fallback()
         if not before_fallback:
@@ -104,7 +106,8 @@ def test_none_edit_between_fallbacks_is_not_replaced_by_fallback_default():
     from agent.route_binding import bind_route_entry
     agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'model-a'})
     agent._primary_runtime['reasoning_config'] = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
-    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+    with adaptive_turn(agent, 'hi', [], True), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
          patch('hermes_cli.config.load_config', return_value=PROFILE):
         assert agent._try_activate_fallback()
         agent.reasoning_config = None
@@ -127,3 +130,90 @@ def test_disabled_turn_is_identical_to_no_adaptive_scope(monkeypatch, reasoning,
     with adaptive_turn(agent, message, [], False):
         disabled = build_api_kwargs(agent, messages, [])
     assert disabled == baseline
+
+
+@pytest.mark.parametrize('snapshot_key', [False, True])
+def test_unset_primary_restored_after_real_fallback(snapshot_key):
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    agent.reasoning_config = None
+    if snapshot_key:
+        agent._primary_runtime['reasoning_config'] = None
+    else:
+        agent._primary_runtime.pop('reasoning_config', None)
+    with adaptive_turn(agent, 'complex task', [], True), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'high'}}):
+        assert agent._try_activate_fallback()
+        assert agent.reasoning_config['effort'] == 'high'
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config is None
+
+
+@pytest.mark.parametrize('explicit', [None, {}, {'enabled': False}, {'enabled': True, 'effort': 'high'}])
+def test_disabled_fallback_matches_legacy_reresolution(explicit):
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    agent.reasoning_config = explicit
+    with adaptive_turn(agent, 'hi', [], False), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'medium'}}):
+        assert agent._try_activate_fallback()
+    assert agent.reasoning_config == {'enabled': True, 'effort': 'medium'}
+    assert '_fallback_reasoning_at_bind' not in vars(agent)
+
+
+@pytest.mark.parametrize('following', [False, True])
+@pytest.mark.parametrize('pin', [None, 'low'])
+def test_policy_uses_actual_turn_model_not_frozen_model(tmp_path, following, pin):
+    config = {'model': {'default': 'model-a', 'provider': 'openrouter'},
+              'agent': {'reasoning_effort': 'medium',
+                        'reasoning_overrides': {'model-a': 'high', 'model-b': 'xhigh'}}}
+    request = {'source': 'cli', 'cwd': str(tmp_path), 'model': 'model-a',
+               'follow_profile_config': following}
+    if pin:
+        request['reasoning'] = pin
+    policy = build_policy(request, config, profile_terminal=False)
+    with patch('gateway.session_authorities.active_authority', return_value=None):
+        assert policy.current_reasoning_config(None, model='model-a')['effort'] == (pin or 'high')
+        assert policy.current_reasoning_config(None, model='model-b')['effort'] == (pin or 'xhigh')
+        assert policy.current_reasoning_config(None, model='model-a')['effort'] == (pin or 'high')
+
+
+@pytest.mark.parametrize('enabled,explicit,expected', [
+    (True, True, 'low'), (True, False, 'high'), (False, True, 'high'),
+])
+def test_real_model_switch_rebinds_baseline_or_keeps_session_pin(enabled, explicit, expected):
+    agent = _make_agent()
+    config = {'agent': {'adaptive_reasoning': enabled, 'reasoning_effort': 'medium',
+                        'reasoning_overrides': {'new-model': 'high'}}}
+    agent.reasoning_config = ({'enabled': True, 'effort': 'low'} if explicit
+                              else resolve_reasoning_config(config, 'old-model'))
+    agent._fallback_reasoning_at_bind = {'enabled': True, 'effort': 'medium'}
+    agent._fallback_reasoning_primary = None
+    with patch('hermes_cli.config.load_config', return_value=config), \
+         patch('agent.model_metadata.get_model_context_length', return_value=131072), \
+         patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        agent.switch_model('new-model', 'custom', api_key='sk-test',
+                           base_url='https://my-llm.example.com/v1')
+    assert agent.reasoning_config['effort'] == expected
+    assert agent._primary_runtime['reasoning_config']['effort'] == expected
+    assert '_fallback_reasoning_at_bind' not in vars(agent)
+    assert '_fallback_reasoning_primary' not in vars(agent)
+
+
+@pytest.mark.parametrize('existing', [False, True])
+def test_voice_route_restores_fallback_tracking(existing):
+    from agent.voice_turn_route import _capture, _reinstall
+    agent = _make_agent()
+    if existing:
+        agent._fallback_reasoning_at_bind = {'enabled': False}
+        agent._fallback_reasoning_primary = None
+    before = {key: value for key, value in vars(agent).items() if key.startswith('_fallback_reasoning_')}
+    state = _capture(agent)
+    agent._fallback_reasoning_at_bind = {'enabled': True}
+    agent._fallback_reasoning_primary = {'effort': 'high'}
+    agent._fallback_reasoning_session_edit = ({},)
+    with patch('agent.route_binding.reinstall_runtime_snapshot'):
+        _reinstall(agent, state)
+    after = {key: value for key, value in vars(agent).items() if key.startswith('_fallback_reasoning_')}
+    assert after == before

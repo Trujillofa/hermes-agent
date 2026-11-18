@@ -2,6 +2,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+import run_agent  # bootstrap during collection, before the home I/O guard
 
 from agent.adaptive_reasoning import adaptive_turn, classify
 from agent.chat_completion_helpers import _reasoning_config_for_wire, _reresolve_fallback_reasoning_config

@@ -2424,9 +2424,14 @@ def switch_model(
     # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
     # YAML False = disabled).
     try:
-        from hermes_constants import resolve_reasoning_config
+        from hermes_constants import ProfileReasoningConfig, resolve_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
-        agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+        config = _sm_load_config() or {}
+        current = getattr(agent, "reasoning_config", None)
+        explicit = current is not None and not (
+            isinstance(current, ProfileReasoningConfig) and current.is_baseline())
+        if not (config.get("agent", {}).get("adaptive_reasoning") is True and explicit):
+            agent.reasoning_config = resolve_reasoning_config(config, agent.model)
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
         )
@@ -2442,6 +2447,10 @@ def switch_model(
     from agent.chat_completion_helpers import _reset_stale_streak
     _reset_stale_streak(agent)
     agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
+    # A deliberate switch ends any old fallback lifecycle; its reasoning markers
+    # must not restore the old model's settings after the next fallback.
+    for name in ("_fallback_reasoning_at_bind", "_fallback_reasoning_primary", "_fallback_reasoning_session_edit"):
+        vars(agent).pop(name, None)
     _finish_switch(agent, new_provider, old_norm, new_norm)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",

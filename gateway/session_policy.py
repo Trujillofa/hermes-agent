@@ -276,7 +276,7 @@ class LocalSessionPolicy:
         # not switch this conversation's toolsets (prompt cache). Only a profile change (``focus`` off) does.
         return tuple(sorted(_resolve_toolsets({}, config, self.source, self.safe_mode, self.coding_posture)))
 
-    def current_reasoning_config(self, runner, session_key=None):
+    def current_reasoning_config(self, runner, session_key=None, model=None):
         """The next turn's reasoning: a typed session /reasoning (the messaging handler's override), else
         the profile's current effort when following, else the frozen one."""
         peek = getattr(runner, '_peek_session_state', None)
@@ -284,10 +284,10 @@ class LocalSessionPolicy:
         if state is not None and state.conversation.reasoning_override is not None:
             return dict(state.conversation.reasoning_override)
         if not self.follows_profile:
-            return self.reasoning_config
+            return self._session_reasoning(self.config(), model or self.model)
         from gateway.session_authorities import active_authority
-        config, model = self.effective(active_authority(runner), secrets=False)
-        return self._session_reasoning(config, model)
+        config, effective_model = self.effective(active_authority(runner), secrets=False)
+        return self._session_reasoning(config, model or effective_model)
 
     def _session_reasoning(self, config, model):
         from hermes_constants import resolve_reasoning_config

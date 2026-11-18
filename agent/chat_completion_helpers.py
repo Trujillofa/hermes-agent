@@ -1992,10 +1992,12 @@ def _update_fallback_context_compressor(agent) -> None:
 def _reresolve_fallback_reasoning_config(agent) -> None:
     """Per-model override > global reasoning_effort (YAML False = disabled); a config load
     failure keeps the current reasoning_config rather than killing the swap."""
-    from hermes_constants import ProfileReasoningConfig
-    current = getattr(agent, "reasoning_config", None)
-    if current is not None and not (isinstance(current, ProfileReasoningConfig) and current.is_baseline()):
-        return  # explicit caller/session settings survive route changes
+    from agent.adaptive_reasoning import active_for_agent
+    if active_for_agent(agent):
+        from hermes_constants import ProfileReasoningConfig
+        current = getattr(agent, "reasoning_config", None)
+        if current is not None and not (isinstance(current, ProfileReasoningConfig) and current.is_baseline()):
+            return  # opted-in turns preserve explicit caller/session settings
     try:
         # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
         # because a config load failure must not kill the swap.

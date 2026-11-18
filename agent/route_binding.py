@@ -93,16 +93,14 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     from agent.route_verdicts import reset_route_verdicts, save_primary_route_verdicts
     save_primary_route_verdicts(agent)  # before the swap: stamped with the endpoint that earned them
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
-    prior = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
-    current = getattr(agent, "reasoning_config", None)
-    if prior is not _NO_REASONING_MARKER and (type(current) is not type(prior) or current != prior):
-        agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
-    elif prior is _NO_REASONING_MARKER:
-        from hermes_constants import ProfileReasoningConfig
-        saved = (getattr(agent, "_primary_runtime", None) or {}).get("reasoning_config")
-        explicit = current is not None and not (
-            isinstance(current, ProfileReasoningConfig) and current.is_baseline())
-        if explicit and saved is not None and (type(current) is not type(saved) or current != saved):
+    from agent.adaptive_reasoning import active_for_agent
+    track_reasoning = active_for_agent(agent) or "_fallback_reasoning_at_bind" in vars(agent)
+    if track_reasoning:
+        prior = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
+        current = getattr(agent, "reasoning_config", None)
+        if prior is _NO_REASONING_MARKER:
+            agent._fallback_reasoning_primary = copy.deepcopy(current)
+        elif type(current) is not type(prior) or current != prior:
             agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
@@ -135,7 +133,8 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     _reresolve_fallback_reasoning_config(agent)
     # Record what the fallback itself installed, not the primary's snapshot. A later
     # session edit must not be overwritten when the primary route comes back.
-    agent._fallback_reasoning_at_bind = copy.deepcopy(getattr(agent, "reasoning_config", None))
+    if track_reasoning:
+        agent._fallback_reasoning_at_bind = copy.deepcopy(getattr(agent, "reasoning_config", None))
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     if commit_pool_choice and choice is not None:
         choice.commit()
@@ -195,6 +194,8 @@ def reinstall_primary_runtime(
     current = getattr(agent, "reasoning_config", None)
     changed = marker is not _NO_REASONING_MARKER and (type(current) is not type(marker) or current != marker)
     edit = (current,) if changed else vars(agent).get("_fallback_reasoning_session_edit")
+    if edit is None and marker is not _NO_REASONING_MARKER:
+        edit = (vars(agent).get("_fallback_reasoning_primary"),)
     if edit is not None:
         current = copy.deepcopy(edit[0])
     reinstall_runtime_snapshot(agent, rt)
@@ -202,6 +203,7 @@ def reinstall_primary_runtime(
         agent.reasoning_config = current
     vars(agent).pop("_fallback_reasoning_at_bind", None)
     vars(agent).pop("_fallback_reasoning_session_edit", None)
+    vars(agent).pop("_fallback_reasoning_primary", None)
     _rebind_primary_credential_pool(
         agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
     )

@@ -5,7 +5,7 @@ from contextvars import ContextVar
 from typing import Any
 
 # Binding to the particular agent prevents nested auxiliary/child work from inheriting it.
-_turn: ContextVar[tuple[Any, str | None] | None] = ContextVar("adaptive_reasoning_turn", default=None)
+_turn: ContextVar[tuple[Any, str | None, bool] | None] = ContextVar("adaptive_reasoning_turn", default=None)
 
 
 def classify(message, history):
@@ -42,12 +42,19 @@ def enabled_for_turn(override):
 
 @contextmanager
 def adaptive_turn(agent, message, history, enabled):
-    decision = classify(message, history) if enabled_for_turn(enabled) else None
-    token = _turn.set((agent, decision))
+    active = enabled_for_turn(enabled)
+    decision = classify(message, history) if active else None
+    token = _turn.set((agent, decision, active))
     try:
         yield
     finally:
         _turn.reset(token)
+
+
+def active_for_agent(agent):
+    """Whether this agent's current turn opted in, including unclassified turns."""
+    turn = _turn.get()
+    return bool(turn and turn[0] is agent and turn[2])
 
 
 def reasoning_for_turn(agent):
