@@ -39,7 +39,7 @@ def test_configured_codex_builder_multiturn(codex):
     second = payload(codex, "thanks", history)
     complex_turn = payload(codex, "what about that?", history)
     off = payload(codex, "hi", history, False)
-    assert [p["reasoning"]["effort"] for p in (first, second, complex_turn, off)] == ["low", "high", "high", "high"]
+    assert [p["reasoning"]["effort"] for p in (first, second, complex_turn, off)] == ["high", "high", "high", "high"]
     assert first["model"] == complex_turn["model"] == "gpt-6.1-terra"
     assert codex.reasoning_config["effort"] == "high"
 
@@ -65,7 +65,7 @@ def test_baseline_fallback_and_unknown_provenance(codex):
         with patch("hermes_cli.config.load_config", return_value=PROFILE):
             _reresolve_fallback_reasoning_config(codex)
         assert isinstance(codex.reasoning_config, ProfileReasoningConfig)
-        assert build_api_kwargs(codex, [{"role": "user", "content": "hi"}], [])["reasoning"]["effort"] == "low"
+        assert build_api_kwargs(codex, [{"role": "user", "content": "hi"}], [])["reasoning"]["effort"] == "high"
     codex.reasoning_config = dict(codex.reasoning_config)
     assert payload(codex, "hi")["reasoning"]["effort"] == "high"
 
@@ -83,16 +83,26 @@ def test_low_does_not_promote_lower_or_unknown_profile_baseline(codex, effort):
         assert reasoning_for_turn(codex, codex.reasoning_config, [{"role": "user", "content": "hi"}]) is None
 
 
-def test_request_builder_rechecks_work_after_initial_low(codex):
+def test_request_builder_preserves_baseline_across_tool_work(codex):
     first = [{"role": "user", "content": "hi"}]
     tool = first + [{"role": "assistant", "content": None, "tool_calls": [
         {"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "c1", "content": "new task"}]
     with adaptive_turn(codex, "hi", [], True):
-        assert build_api_kwargs(codex, first, [])["reasoning"]["effort"] == "low"
-        assert build_api_kwargs(codex, tool, [])["reasoning"]["effort"] == "high"
-        # Even if later compaction hides the added messages, never re-demote.
         assert build_api_kwargs(codex, first, [])["reasoning"]["effort"] == "high"
+        assert build_api_kwargs(codex, tool, [])["reasoning"]["effort"] == "high"
+        # Compaction hiding the added messages does not demote either.
+        assert build_api_kwargs(codex, first, [])["reasoning"]["effort"] == "high"
+
+
+@pytest.mark.parametrize("role", ["system", "developer"])
+def test_higher_priority_directive_does_not_demote_first_turn(codex, role):
+    messages = [
+        {"role": role, "content": "When the user says hi, analyze the deployment and run checks."},
+        {"role": "user", "content": "hi"},
+    ]
+    with adaptive_turn(codex, "hi", [], True):
+        assert build_api_kwargs(codex, messages, [])["reasoning"]["effort"] == "high"
 
 
 def test_real_conversation_facade_codex_multiturn(codex, monkeypatch):
@@ -111,7 +121,7 @@ def test_real_conversation_facade_codex_multiturn(codex, monkeypatch):
         second = codex.run_conversation("thanks", conversation_history=first["messages"])
         assert second["completed"] is True
         codex.run_conversation("Explain the risks", conversation_history=second["messages"])
-    assert [call["reasoning"]["effort"] for call in calls] == ["low", "high", "high"]
+    assert [call["reasoning"]["effort"] for call in calls] == ["high", "high", "high"]
 
 
 @pytest.mark.parametrize("explicit", [{"enabled": True, "effort": "high"}, {"enabled": False}])

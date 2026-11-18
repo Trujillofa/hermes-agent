@@ -40,7 +40,12 @@ def enabled_for_turn(override):
 @contextmanager
 def adaptive_turn(agent, message, history, enabled, *, suppress_decision=False):
     active = enabled_for_turn(enabled)
-    decision = classify(message, history) if active and not suppress_decision else None
+    # A social-looking message does not establish a trivial turn: system or
+    # developer instructions (and tool descriptions) can direct substantial work
+    # on "hi". Nor can we reliably infer that a prior exchange is complete.
+    # Until there is an explicit, trustworthy contract for the entire request,
+    # retain the baseline on *every* turn, including the first one.
+    decision = None
     token = _turn.set((agent, decision, active, message))
     try:
         yield

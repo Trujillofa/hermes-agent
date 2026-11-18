@@ -1,6 +1,9 @@
 # Opt-in adaptive reasoning
 
-Off by default. After installing this change, opt in **only in the intended profile** with
+Off by default. **Automatic effort adaptation is currently suspended**, even when opted in;
+there are no adaptive-effort savings on first turns or follow-ups. The prototype's opt-in
+also changes some fallback and model-switch precedence as described below, so leave it off
+unless testing those behaviors. After installing this change, opt in **only in the intended profile** with
 `hermes config set agent.adaptive_reasoning true`; use `hermes config get agent` to
 check the value. Set it to `false` to disable. A Python caller can pass
 `adaptive_reasoning=True` or `False` to `run_conversation`; a literal per-call boolean
@@ -16,15 +19,16 @@ its own active profile inside the child profile scope, not its parent's decision
 Decisions are scoped by `ContextVar` to the individual agent and turn, and reset even on
 exceptions; no prompts, history, tool schemas, or persistent reasoning settings change.
 
-The deterministic local classifier suggests `low` **only** when the complete user
-message is `hi`, `hello`, `hey`, `thanks`, or `thank you`, ignoring case, whitespace
-and terminal periods/exclamation marks, on turns with no prior history. Any history,
-including malformed or apparently completed exchanges, retains the default. Scripted
-preludes and requests with additional conversation messages also retain the default;
-this includes follow-up model calls after tools or steering. A wrapped gateway message,
-attachment, non-string or longer message retains the existing default.
-There is no classifier network call. This is deliberately narrow, not a general task
-complexity classifier; savings may be negligible.
+The old local social-message classifier is not used to set effort. Even an initial
+`hi` can trigger substantial work under a system or developer directive or a tool
+description, and recognizing harmless instructions reliably is not a safe string
+matching problem. A follow-up like `thanks` can respond to an unresolved decision or
+carry meaning from earlier turns; history may also be truncated or summarized. Neither
+the apparent social wording nor a completed-looking history proves a request is simple.
+The turn hook therefore issues no adaptive suggestion, regardless of message, history,
+or opt-in. There is no classifier network call. A useful future implementation would
+need a trustworthy explicit contract for the whole request and evaluation of its
+failure modes; this prototype does not supply one or claim such a guarantee.
 
 Explicit session/API `reasoning_config` (including disabled) wins, and any nonempty
 `request_overrides` suppresses adaptation. A profile-resolved enabled config is a
@@ -35,9 +39,9 @@ baseline likewise make it explicit. Explicit reasoning is retained during fallba
 profile baselines re-resolve for the fallback model. The one-shot continuation
 reasoning-off, route rejection handling and provider clamping retain precedence. A
 baseline below `low`, or an unknown baseline, is never promoted to `low`.
-Adaptation is limited to OpenAI Codex Responses and chat-completions routes where the
-existing unset-reasoning resolver returns a default. The Codex transport clamps effort
-to the route's declared vocabulary; request rejection can suppress reasoning.
+The dormant wire hook is limited to OpenAI Codex Responses and chat-completions routes
+where the existing unset-reasoning resolver returns a default. The Codex transport clamps
+effort to the route's declared vocabulary; request rejection can suppress reasoning.
 
 Direct auxiliary calls (including compression, title generation, vision and direct MoA
 calls) bypass this hook. Separate auxiliary/fork agents that run the facade use their
@@ -63,6 +67,7 @@ export HERMES_HOME="$HOME/.hermes"
 export HERMES_PYTHON=/absolute/path/to/test-venv/bin/python
 scripts/run_tests.sh -j 1 \
   tests/agent/test_adaptive_reasoning.py tests/agent/test_adaptive_codex_integration.py \
+  tests/agent/test_adaptive_session_provenance.py \
   tests/agent/test_unset_reasoning_effort_default.py \
   tests/agent/test_fallback_reasoning_override.py \
   tests/gateway/test_background_child_approval_after_turn.py \
@@ -78,7 +83,7 @@ scripts/run_tests.sh -j 1 \
 
 The wrapper runs each file in its own subprocess; `-j 1` avoids concurrent reuse of the
 explicit pytest base directory. Adaptive tests exercise mock-provider request payloads
-through the actual Telegram turn runner, CLI quiet single-query, delegated child worker,
+through the Telegram turn runner (including passed-back conversation history), CLI quiet single-query, delegated child worker,
 and cron watchdog, plus explicit reasoning and next-turn isolation. Profile config is
 also read in an isolated subprocess. The Codex test builds actual Responses payloads
 and runs three conversation turns against a mocked dispatch with the default profile's

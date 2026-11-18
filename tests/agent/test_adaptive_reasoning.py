@@ -1,4 +1,4 @@
-"""Opt-in adaptive effort uses only a narrow first-turn social allowlist."""
+"""Adaptive effort fails closed even for social turns and gateway history."""
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -58,7 +58,7 @@ def test_actual_tool_round_restores_baseline_and_prelude_is_conservative():
             agent.run_conversation("hi", adaptive_reasoning=True)
             agent.run_conversation("hi", adaptive_reasoning=True, prelude=prelude())
         calls = agent.client.chat.completions.create.call_args_list
-        assert [c.kwargs["reasoning_effort"] for c in calls] == ["low", "medium", "medium"]
+        assert [c.kwargs["reasoning_effort"] for c in calls] == ["medium", "medium", "medium"]
 
 
 def test_scope_overrides_fallback_and_exception_cleanup():
@@ -69,7 +69,7 @@ def test_scope_overrides_fallback_and_exception_cleanup():
     with patch("agent.models_dev.get_model_capabilities", return_value=None):
         assert _reasoning_config_for_wire(agent)["effort"] == "medium"
         with pytest.raises(ValueError), adaptive_turn(agent, "hi", None, True):
-            assert _reasoning_config_for_wire(agent)["effort"] == "low"
+            assert _reasoning_config_for_wire(agent)["effort"] == "medium"
             assert _reasoning_config_for_wire(other)["effort"] == "medium"
             agent.reasoning_config = {"enabled": True, "effort": "high"}
             assert _reasoning_config_for_wire(agent)["effort"] == "high"
@@ -79,10 +79,10 @@ def test_scope_overrides_fallback_and_exception_cleanup():
             agent.request_overrides = {"reasoning_effort": "high"}
             assert _reasoning_config_for_wire(agent)["effort"] == "medium"
             agent.request_overrides = None
-            # Real fallback resolver: no configured fallback effort retains the decision.
+            # Real fallback resolver retains the configured baseline.
             with patch("hermes_cli.config.load_config", return_value={}):
                 _reresolve_fallback_reasoning_config(agent)
-            assert _reasoning_config_for_wire(agent)["effort"] == "low"
+            assert _reasoning_config_for_wire(agent)["effort"] == "medium"
             raise ValueError("abort")
         assert _reasoning_config_for_wire(agent)["effort"] == "medium"
 
@@ -131,7 +131,7 @@ def test_real_turn_wire_and_next_turn_isolation():
             first = agent.run_conversation("hi", adaptive_reasoning=True)
             agent.run_conversation("Explain the risks", conversation_history=first["messages"], adaptive_reasoning=True)
         calls = agent.client.chat.completions.create.call_args_list
-        assert calls[0].kwargs["reasoning_effort"] == "low"
+        assert calls[0].kwargs["reasoning_effort"] == "medium"
         assert calls[1].kwargs["reasoning_effort"] == "medium"
         assert calls[0].kwargs["messages"][0] == calls[1].kwargs["messages"][0]
         assert agent.reasoning_config is None
@@ -157,13 +157,17 @@ def test_fallback_explicit_and_nested_scope():
             with adaptive_turn(child, "explain risks", [], True):
                 assert _reasoning_config_for_wire(child)["effort"] == "medium"
                 assert _reasoning_config_for_wire(parent)["effort"] == "medium"
-            assert _reasoning_config_for_wire(parent)["effort"] == "low"
+            assert _reasoning_config_for_wire(parent)["effort"] == "medium"
             with patch("hermes_cli.config.load_config", return_value={"agent": {"reasoning_effort": "high"}}):
                 _reresolve_fallback_reasoning_config(parent)
-            assert _reasoning_config_for_wire(parent)["effort"] == "low"
+            assert _reasoning_config_for_wire(parent)["effort"] == "high"
 
 
-def test_telegram_gateway_to_real_payload():
+@pytest.mark.parametrize("prompt", [
+    "You are helpful.",
+    "When the user says hi, research and compare five backup recovery plans before replying.",
+])
+def test_telegram_gateway_to_real_payload(prompt):
     import asyncio
     from gateway.config import Platform
     from tests.gateway.test_background_child_approval_after_turn import _Adapter, _turn
@@ -182,15 +186,23 @@ def test_telegram_gateway_to_real_payload():
                             skip_context_files=True, skip_memory=True)
             agent.client = MagicMock()
             agent.client.chat.completions.create.return_value = _mock_response(content="Hello!")
-            agent._cached_system_prompt = "You are helpful."
+            agent._cached_system_prompt = prompt
             agent._use_prompt_caching = False
             agent.compression_enabled = agent.save_trajectories = False
             turn = _turn(Platform.TELEGRAM, _Adapter("telegram"), loop)
             turn._ctx.message = "hi"
             with patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"), \
                  patch.object(agent, "_cleanup_task_resources"):
-                turn._run_conversation_with_approval(agent, [], None, None, None)
-            assert agent.client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "low"
+                first = turn._run_conversation_with_approval(agent, [], None, None, None)
+                turn._ctx.message = "thanks"
+                second = turn._run_conversation_with_approval(agent, first["messages"], None, None, None)
+                turn._ctx.message = "what about that?"
+                turn._run_conversation_with_approval(agent, second["messages"], None, None, None)
+            calls = agent.client.chat.completions.create.call_args_list
+            assert [c.kwargs["reasoning_effort"] for c in calls] == ["medium"] * 3
+            assert any(prompt in str(m.get("content")) for m in calls[0].kwargs["messages"])
+            assert any(m.get("content") == "hi" for m in calls[1].kwargs["messages"])
+            assert any(m.get("content") == "thanks" for m in calls[2].kwargs["messages"])
     finally:
         loop.close()
 
@@ -234,7 +246,7 @@ def test_thread_scopes_are_isolated():
                    threading.Thread(target=worker, args=("complex", "explain risk"))]
         for thread in threads: thread.start()
         for thread in threads: thread.join(timeout=10)
-    assert results == {"social": "low", "complex": "medium"}
+    assert results == {"social": "medium", "complex": "medium"}
 
 
 @pytest.mark.parametrize("surface", ["cli", "cron", "delegate"])
@@ -276,7 +288,7 @@ def test_normal_cli_and_cron_turns_reach_payload(surface):
                     with pytest.raises(SystemExit) as exc:
                         _run_quiet_single_query(cli, "hi")
                     assert exc.value.code == 0
-        assert agent.client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "low"
+        assert agent.client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "medium"
 
 
 @pytest.mark.parametrize("config,overrides,expected", [
