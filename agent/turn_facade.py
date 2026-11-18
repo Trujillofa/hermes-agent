@@ -78,6 +78,7 @@ class TurnFacadeMixin:
         token = affinity_token = acct_token = None
         task_started = task_finished = False
         relay_outcome = "failed"
+        original_history = conversation_history
 
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
@@ -144,7 +145,10 @@ class TurnFacadeMixin:
             # Keep the ContextVar scope local (agent tokens may be observed from another thread).
             # A host that owns this thread (Hermes Console) may cancel the turn cross-thread.
             with bind_subagent_parent(self), scoped_runtime_main({}), track_in_interrupt_scope(self), \
-                    adaptive_turn(self, user_message, conversation_history, adaptive_reasoning):
+                    adaptive_turn(self, user_message, conversation_history, adaptive_reasoning,
+                                  suppress_decision=prelude is not None or (
+                                      original_history is not None and (
+                                          not isinstance(original_history, list) or bool(original_history)))):
                 try:
                     if lease is not None:
                         lease.start()

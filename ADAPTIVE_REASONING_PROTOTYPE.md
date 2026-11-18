@@ -18,10 +18,11 @@ exceptions; no prompts, history, tool schemas, or persistent reasoning settings 
 
 The deterministic local classifier suggests `low` **only** when the complete user
 message is `hi`, `hello`, `hey`, `thanks`, or `thank you`, ignoring case, whitespace
-and terminal periods/exclamation marks. Completed prior exchanges are allowed; a
-malformed history or one ending in a user/tool message or pending assistant tool call
-retains the default. A wrapped gateway message, attachment, non-string or longer
-message retains the existing default.
+and terminal periods/exclamation marks, on turns with no prior history. Any history,
+including malformed or apparently completed exchanges, retains the default. Scripted
+preludes and requests with additional conversation messages also retain the default;
+this includes follow-up model calls after tools or steering. A wrapped gateway message,
+attachment, non-string or longer message retains the existing default.
 There is no classifier network call. This is deliberately narrow, not a general task
 complexity classifier; savings may be negligible.
 
@@ -32,7 +33,8 @@ Profile provenance is tracked in memory; if a path strips it (for example, seria
 and reconstructs a plain dict), adaptation fails closed. In-place changes that alter a
 baseline likewise make it explicit. Explicit reasoning is retained during fallback;
 profile baselines re-resolve for the fallback model. The one-shot continuation
-reasoning-off, route rejection handling and provider clamping retain precedence.
+reasoning-off, route rejection handling and provider clamping retain precedence. A
+baseline below `low`, or an unknown baseline, is never promoted to `low`.
 Adaptation is limited to OpenAI Codex Responses and chat-completions routes where the
 existing unset-reasoning resolver returns a default. The Codex transport clamps effort
 to the route's declared vocabulary; request rejection can suppress reasoning.

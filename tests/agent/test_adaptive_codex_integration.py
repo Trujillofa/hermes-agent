@@ -39,7 +39,7 @@ def test_configured_codex_builder_multiturn(codex):
     second = payload(codex, "thanks", history)
     complex_turn = payload(codex, "what about that?", history)
     off = payload(codex, "hi", history, False)
-    assert [p["reasoning"]["effort"] for p in (first, second, complex_turn, off)] == ["low", "low", "high", "high"]
+    assert [p["reasoning"]["effort"] for p in (first, second, complex_turn, off)] == ["low", "high", "high", "high"]
     assert first["model"] == complex_turn["model"] == "gpt-6.1-terra"
     assert codex.reasoning_config["effort"] == "high"
 
@@ -75,6 +75,26 @@ def test_request_override_suppresses_adaptation(codex):
     assert payload(codex, "hi")["reasoning"]["effort"] == "high"
 
 
+@pytest.mark.parametrize("effort", ["minimal", "none", "unknown"])
+def test_low_does_not_promote_lower_or_unknown_profile_baseline(codex, effort):
+    codex.reasoning_config = ProfileReasoningConfig({"enabled": True, "effort": effort})
+    from agent.adaptive_reasoning import reasoning_for_turn
+    with adaptive_turn(codex, "hi", [], True):
+        assert reasoning_for_turn(codex, codex.reasoning_config, [{"role": "user", "content": "hi"}]) is None
+
+
+def test_request_builder_rechecks_work_after_initial_low(codex):
+    first = [{"role": "user", "content": "hi"}]
+    tool = first + [{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "new task"}]
+    with adaptive_turn(codex, "hi", [], True):
+        assert build_api_kwargs(codex, first, [])["reasoning"]["effort"] == "low"
+        assert build_api_kwargs(codex, tool, [])["reasoning"]["effort"] == "high"
+        # Even if later compaction hides the added messages, never re-demote.
+        assert build_api_kwargs(codex, first, [])["reasoning"]["effort"] == "high"
+
+
 def test_real_conversation_facade_codex_multiturn(codex, monkeypatch):
     from tests.agent.test_run_agent_codex_responses import _codex_message_response
     calls = []
@@ -91,7 +111,7 @@ def test_real_conversation_facade_codex_multiturn(codex, monkeypatch):
         second = codex.run_conversation("thanks", conversation_history=first["messages"])
         assert second["completed"] is True
         codex.run_conversation("Explain the risks", conversation_history=second["messages"])
-    assert [call["reasoning"]["effort"] for call in calls] == ["low", "low", "high"]
+    assert [call["reasoning"]["effort"] for call in calls] == ["low", "high", "high"]
 
 
 @pytest.mark.parametrize("explicit", [{"enabled": True, "effort": "high"}, {"enabled": False}])

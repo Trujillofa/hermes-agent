@@ -57,7 +57,10 @@ def run_tool_round(
     durability invariant: resume must see the executed block if a destructive tool restarts
     Hermes; a failed canonical append ends the turn rather than running tools from
     process-only state."""
+    from agent.adaptive_reasoning import invalidate_decision
     from agent.conversation_loop import _invalid_tool_name_error_content
+
+    invalidate_decision(agent)
 
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> ToolRoundVerdict:
         return ToolRoundVerdict(

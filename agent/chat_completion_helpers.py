@@ -1288,7 +1288,7 @@ def _consume_ephemeral_reasoning_off(agent) -> bool:
     return consumed
 
 
-def _reasoning_config_for_wire(agent):
+def _reasoning_config_for_wire(agent, messages=None):
     """``agent.reasoning_config`` with the one-shot reasoning-off override applied.
 
     Once the route has answered a disable with "reasoning is mandatory"
@@ -1316,7 +1316,7 @@ def _reasoning_config_for_wire(agent):
             or (getattr(agent, "api_mode", None) == "codex_responses"
                 and getattr(agent, "provider", None) == "openai-codex")):
         from agent.adaptive_reasoning import reasoning_for_turn
-        cfg = reasoning_for_turn(agent) or cfg
+        cfg = reasoning_for_turn(agent, cfg, messages) or cfg
     if getattr(agent, "_reasoning_disable_rejected", False):
         # The route rejects disables. Resend exactly what the session has
         # been sending — the user's own config — so the retry lands on the
@@ -1510,7 +1510,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     # One-shot continuation override — consumed exactly once, on the FIRST
     # request this call builds (only one api_mode branch runs per invocation).
-    reasoning_config = _reasoning_config_for_wire(agent)
+    reasoning_config = _reasoning_config_for_wire(agent, api_messages)
     if tools_for_api is None:
         tools_for_api = agent.tools
     # The one place request_overrides are consumed: static /fast values are already pinned

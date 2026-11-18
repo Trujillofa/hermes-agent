@@ -17,8 +17,48 @@ def test_social_allowlist(message):
 def test_uncertainty_keeps_default(message):
     assert classify(message, None) is None
     assert classify("hi", [{"role": "user", "content": "earlier"}]) is None
-    assert classify("hi", [{"role": "assistant", "content": "done"}]) == "low"
+    assert classify("hi", [{"role": "assistant", "content": "done"}]) is None
     assert classify("hi", [None]) is None
+
+
+@pytest.mark.parametrize("history", [
+    [{"role": "assistant", "content": "Should I delete the backups?"}],
+    [{}, {"role": "assistant", "content": "done"}],
+    [{"role": "bogus"}, {"role": "assistant", "content": "done"}],
+    "", (), {"role": "assistant", "content": "done"},
+])
+def test_history_or_pending_decision_never_demotes(history):
+    assert classify("thanks", history) is None
+
+
+def test_actual_tool_round_restores_baseline_and_prelude_is_conservative():
+    from run_agent import AIAgent
+    from tests.agent.test_run_agent import _mock_response, _mock_tool_call
+
+    with patch("model_tools.get_tool_definitions", return_value=[]), \
+         patch("model_tools.check_toolset_requirements", return_value={}), \
+         patch("agent.process_bootstrap.OpenAI"), \
+         patch("agent.models_dev.get_model_capabilities", return_value=None):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="http://127.0.0.1:8000/v1",
+                        provider="custom:relay", model="test-model", quiet_mode=True,
+                        skip_context_files=True, skip_memory=True)
+        agent.client = MagicMock()
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[
+                _mock_tool_call(name="web_search", arguments="{}", call_id="c1")]),
+            _mock_response(content="done"), _mock_response(content="done")]
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.compression_enabled = agent.save_trajectories = False
+        def prelude():
+            yield "Working", "web_search", {}
+        with patch("model_tools.handle_function_call", return_value="new work"), \
+             patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"), \
+             patch.object(agent, "_cleanup_task_resources"):
+            agent.run_conversation("hi", adaptive_reasoning=True)
+            agent.run_conversation("hi", adaptive_reasoning=True, prelude=prelude())
+        calls = agent.client.chat.completions.create.call_args_list
+        assert [c.kwargs["reasoning_effort"] for c in calls] == ["low", "medium", "medium"]
 
 
 def test_scope_overrides_fallback_and_exception_cleanup():
@@ -58,6 +98,15 @@ def test_disabled_and_unsupported_routes_do_not_gain_reasoning():
     with patch("agent.models_dev.get_model_capabilities", return_value=ModelCapabilities(supports_reasoning=False)):
         with adaptive_turn(agent, "hi", None, True):
             assert _reasoning_config_for_wire(agent) is None
+
+
+def test_profile_minimal_is_preserved_on_chat_wire():
+    from hermes_constants import ProfileReasoningConfig
+    from tests.agent.test_unset_reasoning_effort_default import _Agent
+    agent = _Agent(ProfileReasoningConfig({"enabled": True, "effort": "minimal"}))
+    with patch("agent.models_dev.get_model_capabilities", return_value=None), \
+         adaptive_turn(agent, "hi", [], True):
+        assert _reasoning_config_for_wire(agent, [{"role": "user", "content": "hi"}])["effort"] == "minimal"
 
 
 def test_real_turn_wire_and_next_turn_isolation():
