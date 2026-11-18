@@ -9,8 +9,15 @@ _turn: ContextVar[tuple[Any, str | None] | None] = ContextVar("adaptive_reasonin
 
 
 def classify(message, history):
-    """Only standalone, exact social utterances qualify; uncertainty keeps defaults."""
-    if history or not isinstance(message, str):
+    """Only exact social utterances qualify; malformed history fails closed."""
+    if not isinstance(message, str) or (history is not None and (
+        not isinstance(history, list) or any(not isinstance(item, dict) for item in history)
+    )):
+        return None
+    # A pending tool result or unfinished exchange may carry obligations that a
+    # terse user message does not reveal; do not demote those turns.
+    if history and (history[-1].get("role") != "assistant" or history[-1].get("tool_calls")
+                    or history[-1].get("function_call") or not isinstance(history[-1].get("content"), str)):
         return None
     text = message.strip().lower().rstrip("!. ")
     if text in {"hi", "hello", "hey", "thanks", "thank you"}:
@@ -44,10 +51,16 @@ def adaptive_turn(agent, message, history, enabled):
 
 
 def reasoning_for_turn(agent):
-    """Return a suggestion only absent explicit config/overrides on the current route."""
+    """Return a suggestion only for a profile baseline, never an explicit decision."""
     turn = _turn.get()
     if not turn or turn[0] is not agent or turn[1] is None:
         return None
-    if getattr(agent, "reasoning_config", None) is not None or getattr(agent, "request_overrides", None):
+    from hermes_constants import ProfileReasoningConfig
+    cfg = getattr(agent, "reasoning_config", None)
+    if cfg is not None and not (isinstance(cfg, ProfileReasoningConfig) and cfg.is_baseline()):
+        return None
+    if isinstance(cfg, dict) and (cfg.get("enabled") is False or cfg.get("effort") == "none"):
+        return None
+    if getattr(agent, "request_overrides", None):
         return None
     return {"enabled": True, "effort": turn[1]}

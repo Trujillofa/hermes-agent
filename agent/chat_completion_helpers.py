@@ -1310,9 +1310,13 @@ def _reasoning_config_for_wire(agent):
         # route's own, recorded below as what went out so a rejection of it lands in the branch above.
         from agent.reasoning_params import unset_reasoning_default
         cfg = unset_reasoning_default(agent)
-        if cfg is not None:
-            from agent.adaptive_reasoning import reasoning_for_turn
-            cfg = reasoning_for_turn(agent) or cfg
+    # Codex Responses has its own default rather than an unset chat default.
+    from agent.reasoning_params import unset_reasoning_default
+    if ((getattr(agent, "api_mode", None) == "chat_completions" and unset_reasoning_default(agent) is not None)
+            or (getattr(agent, "api_mode", None) == "codex_responses"
+                and getattr(agent, "provider", None) == "openai-codex")):
+        from agent.adaptive_reasoning import reasoning_for_turn
+        cfg = reasoning_for_turn(agent) or cfg
     if getattr(agent, "_reasoning_disable_rejected", False):
         # The route rejects disables. Resend exactly what the session has
         # been sending — the user's own config — so the retry lands on the
@@ -1988,6 +1992,10 @@ def _update_fallback_context_compressor(agent) -> None:
 def _reresolve_fallback_reasoning_config(agent) -> None:
     """Per-model override > global reasoning_effort (YAML False = disabled); a config load
     failure keeps the current reasoning_config rather than killing the swap."""
+    from hermes_constants import ProfileReasoningConfig
+    current = getattr(agent, "reasoning_config", None)
+    if current is not None and not (isinstance(current, ProfileReasoningConfig) and current.is_baseline()):
+        return  # explicit caller/session settings survive route changes
     try:
         # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
         # because a config load failure must not kill the swap.

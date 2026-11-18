@@ -16,6 +16,8 @@ def test_social_allowlist(message):
 def test_uncertainty_keeps_default(message):
     assert classify(message, None) is None
     assert classify("hi", [{"role": "user", "content": "earlier"}]) is None
+    assert classify("hi", [{"role": "assistant", "content": "done"}]) == "low"
+    assert classify("hi", [None]) is None
 
 
 def test_scope_overrides_fallback_and_exception_cleanup():
@@ -108,7 +110,7 @@ def test_fallback_explicit_and_nested_scope():
             assert _reasoning_config_for_wire(parent)["effort"] == "low"
             with patch("hermes_cli.config.load_config", return_value={"agent": {"reasoning_effort": "high"}}):
                 _reresolve_fallback_reasoning_config(parent)
-            assert _reasoning_config_for_wire(parent)["effort"] == "high"
+            assert _reasoning_config_for_wire(parent)["effort"] == "low"
 
 
 def test_telegram_gateway_to_real_payload():
@@ -151,9 +153,15 @@ def test_real_profile_config_in_isolated_subprocess(tmp_path):
     profile = home / ".hermes"
     profile.mkdir(parents=True)
     config = profile / "config.yaml"
-    config.write_text("agent:\n  adaptive_reasoning: true\n")
+    config.write_text("model:\n  default: gpt-6.1-terra\n  provider: openai-codex\n"
+                      "agent:\n  adaptive_reasoning: true\n  reasoning_effort: medium\n"
+                      "  reasoning_overrides:\n    openai-codex/gpt-6.1-terra: high\n")
     env = {**os.environ, "HOME": str(home), "HERMES_HOME": str(profile)}
     code = ("from agent.adaptive_reasoning import enabled_for_turn; "
+            "from hermes_cli.config import load_config; "
+            "from hermes_constants import resolve_reasoning_config, ProfileReasoningConfig; "
+            "cfg=load_config(); value=resolve_reasoning_config(cfg, cfg['model']['default']); "
+            "assert isinstance(value, ProfileReasoningConfig) and value['effort'] == 'high'; "
             "assert enabled_for_turn(None) is True; "
             "assert enabled_for_turn(False) is False")
     subprocess.run([sys.executable, "-c", code], env=env, check=True)
