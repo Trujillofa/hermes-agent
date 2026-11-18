@@ -268,6 +268,8 @@ DEFAULT_CONFIG = {
         # Model name (any reasonable spelling) -> effort level; overrides agent.reasoning_effort
         # when the current model matches. Edit in config.yaml (no CLI support: dots in keys).
         "reasoning_overrides": {},
+        # Conservative turn-local suggestion; explicit reasoning always wins.
+        "adaptive_reasoning": False,
         # Stored reasoning is replayed to every provider that can read it by default. This flag
         # only adds the must-echo " " pad on reasoning-less tool-call turns, which DeepSeek,
         # Kimi/Moonshot and Xiaomi MiMo require (auto-detected by provider name/host). Set

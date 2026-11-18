@@ -18,9 +18,24 @@ def classify(message, history):
     return None
 
 
+def enabled_for_turn(override):
+    """An explicit per-call boolean wins; otherwise read the active profile each turn.
+
+    Only a literal boolean enables the feature. Bad/missing config fails closed.
+    """
+    if override is not None:
+        return override is True
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        return config.get("agent", {}).get("adaptive_reasoning") is True
+    except Exception:
+        return False
+
+
 @contextmanager
 def adaptive_turn(agent, message, history, enabled):
-    decision = classify(message, history) if enabled is True else None
+    decision = classify(message, history) if enabled_for_turn(enabled) else None
     token = _turn.set((agent, decision))
     try:
         yield

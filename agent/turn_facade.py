@@ -30,7 +30,7 @@ class TurnFacadeMixin:
         relay_metadata: Optional[dict[str, Any]] = None,
         title_user_message: Optional[str]=None,
         prelude: Optional[Generator]=None,
-        adaptive_reasoning: bool = False,
+        adaptive_reasoning: bool | None = None,
     ) -> dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
