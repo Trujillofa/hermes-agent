@@ -163,7 +163,11 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
         current, marker = agent.reasoning_config, agent._fallback_reasoning_at_bind
         if type(current) is not type(marker) or current != marker:
             agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
-    state: dict[str, Any] = {"reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None))}
+    from agent.adaptive_reasoning import active_for_agent
+    state: dict[str, Any] = {
+        "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
+        "track_reasoning": active_for_agent(agent) or "_fallback_reasoning_at_bind" in vars(agent),
+    }
     state["reasoning_markers"] = {
         name: copy.deepcopy(vars(agent)[name]) if name in vars(agent) else _MISSING
         for name in _REASONING_FIELDS
@@ -184,7 +188,10 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
             _reinstall(agent, state)
             _warn_once(agent, target, reason)
             agent._voice_route_state = {"reasoning_config": state["reasoning_config"],
-                                        "reasoning_markers": state["reasoning_markers"]}
+                                        "reasoning_markers": state["reasoning_markers"],
+                                        "track_reasoning": state["track_reasoning"]}
+            if state["track_reasoning"]:
+                agent._voice_route_state["reasoning_at_bind"] = copy.deepcopy(agent.reasoning_config)
             return agent._cached_system_prompt or system_prompt
         if (choice := getattr(agent, "_route_pool_choice", None)) is not None:
             choice.commit()  # the voice model takes the turn: its pool key is now in use
@@ -198,6 +205,8 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
             agent.reasoning_config = _voice_reasoning(agent, effort)
         if "_fallback_reasoning_at_bind" in vars(agent):
             agent._fallback_reasoning_at_bind = copy.deepcopy(agent.reasoning_config)
+    if state["track_reasoning"]:
+        state["reasoning_at_bind"] = copy.deepcopy(agent.reasoning_config)
     return agent._cached_system_prompt or system_prompt
 
 
@@ -232,8 +241,8 @@ def end_voice_turn_route(agent: Any) -> None:
     if not state:
         return
     edit = state.get("reasoning_session_edit")
-    if "_fallback_reasoning_at_bind" in vars(agent):
-        current, marker = agent.reasoning_config, agent._fallback_reasoning_at_bind
+    if "reasoning_at_bind" in state:
+        current, marker = agent.reasoning_config, state["reasoning_at_bind"]
         if type(current) is not type(marker) or current != marker:
             edit = (copy.deepcopy(current),)
     agent._voice_route_state = None

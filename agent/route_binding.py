@@ -114,6 +114,11 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     if track_reasoning:
         prior = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
         current = getattr(agent, "reasoning_config", None)
+        voice = vars(agent).get("_voice_route_state")
+        if voice and "reasoning_at_bind" in voice:
+            voice_marker = voice["reasoning_at_bind"]
+            if type(current) is not type(voice_marker) or current != voice_marker:
+                voice["reasoning_session_edit"] = (copy.deepcopy(current),)
         if prior is _NO_REASONING_MARKER:
             agent._fallback_reasoning_primary = copy.deepcopy(current)
         elif type(current) is not type(prior) or current != prior:
@@ -153,6 +158,9 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     # session edit must not be overwritten when the primary route comes back.
     if track_reasoning:
         agent._fallback_reasoning_at_bind = copy.deepcopy(getattr(agent, "reasoning_config", None))
+        voice = vars(agent).get("_voice_route_state")
+        if voice and "reasoning_at_bind" in voice:
+            voice["reasoning_at_bind"] = copy.deepcopy(agent.reasoning_config)
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     if commit_pool_choice and choice is not None:
         choice.commit()

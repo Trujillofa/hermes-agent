@@ -549,3 +549,54 @@ def test_voice_override_does_not_hide_or_invent_session_edits(separate_voice, mo
         end_voice_turn_route(agent)
         assert agent._restore_primary_runtime()
     assert agent.reasoning_config["effort"] == ("xhigh" if mode == "in_place" else "high")
+
+
+@pytest.mark.parametrize("edit", [None, {}, {"enabled": False}, {"enabled": True, "effort": "low"}])
+@pytest.mark.parametrize("mutate", [False, True])
+def test_same_route_voice_edit_without_fallback(edit, mutate):
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    agent = _make_agent()
+    agent.reasoning_config = resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}, agent.model)
+    with adaptive_turn(agent, "work", [], True), \
+         patch("agent.auxiliary_task_config._get_auxiliary_task_config", return_value={"reasoning_effort": "low"}), \
+         patch("agent.voice_turn_route._route_target", return_value=None):
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [], None)
+        agent.reasoning_config = edit.copy() if isinstance(edit, dict) else edit
+        if mutate and isinstance(edit, dict):
+            agent.reasoning_config["custom"] = "edited"
+        end_voice_turn_route(agent)
+    expected = {**edit, "custom": "edited"} if mutate and isinstance(edit, dict) else edit
+    assert agent.reasoning_config == expected
+    assert type(agent.reasoning_config) is type(expected)
+
+
+@pytest.mark.parametrize("separate_voice", [False, True])
+@pytest.mark.parametrize("prior_fallback", [False, True])
+def test_voice_assignment_then_in_place_edit_survives_nested_fallback(separate_voice, prior_fallback):
+    from agent.route_binding import bind_route_entry
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    agent = _make_agent(fallback_model={"provider": "openrouter", "model": "fallback"})
+    primary = resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime["reasoning_config"] = primary
+    target = {"provider": "openrouter", "model": "voice"} if separate_voice else None
+    with adaptive_turn(agent, "work", [], True), \
+         patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)), \
+         patch("hermes_cli.config.load_config", return_value={"agent": {"reasoning_effort": "medium"}}), \
+         patch("agent.auxiliary_task_config._get_auxiliary_task_config", return_value={"reasoning_effort": "low"}), \
+         patch("agent.voice_turn_route._route_target", return_value=target), \
+         patch("agent.voice_turn_route._fits", return_value=True), \
+         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        if prior_fallback:
+            assert agent._try_activate_fallback()
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [], None)
+        agent.reasoning_config = {"enabled": True, "effort": "low"}
+        agent.reasoning_config["effort"] = "xhigh"
+        assert bind_route_entry(agent, {"provider": "openrouter", "model": "voice-fallback"},
+                                "openrouter", "voice-fallback") is not None
+        end_voice_turn_route(agent)
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+        if prior_fallback:
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
