@@ -1,0 +1,568 @@
+"""Session reasoning provenance through gateway, fallback, and route restoration.
+
+Regression coverage for four defects, each of which lost an explicit reasoning
+choice:
+
+* a fallback route's re-resolution replaced the session's own setting, and
+  restoring the primary route resurrected a stale snapshot over a later edit
+  (including an equal value, ``None``, and a plain attribute assignment);
+* a model switch re-resolved reasoning from the process profile instead of the
+  session policy bound to the turn;
+* a delegated child inherited the parent's copied policy instead of using its
+  own (or its process config);
+* a voice turn's effort override hid the session's edit, and a fallback that
+  activated during the voice turn restored over it.
+
+The fixes are unconditional: no feature flag, no classifier.
+"""
+import json
+from dataclasses import replace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from agent.chat_completion_helpers import build_api_kwargs, _reresolve_fallback_reasoning_config
+from gateway.session_policy import build_policy, pin_reasoning_effort, unpin_reasoning
+from hermes_constants import ProfileReasoningConfig, resolve_reasoning_config
+from tests.agent.test_primary_runtime_restore import _make_agent, _mock_resolve
+from tests.agent.test_run_agent_codex_responses import _build_agent
+
+PROFILE = {
+    "model": {"default": "gpt-6.1-terra", "provider": "openai-codex"},
+    "agent": {"reasoning_effort": "medium",
+              "reasoning_overrides": {"openai-codex/gpt-6.1-terra": "high",
+                                      "opencode-go/deepseek-v4.1-flash": "high"}},
+}
+
+
+# ── gateway pins are explicit, not profile baselines ──────────────────────────
+
+@pytest.mark.parametrize('following', [False, True])
+@pytest.mark.parametrize('pin', ['high', 'none'])
+def test_gateway_launch_pin_is_explicit_on_wire_and_fallback(tmp_path, monkeypatch, following, pin):
+    request = {'source': 'cli', 'cwd': str(tmp_path), 'model': 'gpt-6.1-terra',
+               'reasoning': pin, 'follow_profile_config': following}
+    policy = build_policy(request, PROFILE, profile_terminal=False)
+    agent = _build_agent(monkeypatch)
+    agent.model, agent.provider, agent.api_mode = 'gpt-6.1-terra', 'openai-codex', 'codex_responses'
+    agent.reasoning_config = policy.current_reasoning_config(None)
+    agent.request_overrides = None
+    explicit = agent.reasoning_config.copy()
+    assert type(agent.reasoning_config) is dict
+    before = build_api_kwargs(agent, [{'role': 'user', 'content': 'hi'}], [])
+    with patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'medium'}}):
+        _reresolve_fallback_reasoning_config(agent)
+    after = build_api_kwargs(agent, [{'role': 'user', 'content': 'hi'}], [])
+    assert agent.reasoning_config == explicit
+    assert before.get('reasoning') == after.get('reasoning')
+    assert before.get('reasoning', {}).get('effort') != 'low'
+    if pin == 'high':
+        assert before['reasoning']['effort'] == 'high'
+
+
+@pytest.mark.parametrize('following', [False, True])
+def test_committed_pin_and_reset_provenance(tmp_path, following):
+    request = {'source': 'cli', 'cwd': str(tmp_path), 'model': 'gpt-6.1-terra',
+               'reasoning': 'high', 'follow_profile_config': following}
+    policy = build_policy(request, PROFILE, profile_terminal=False)
+    cfg = policy.config()
+    unpin_reasoning(cfg, PROFILE)
+    policy = replace(policy, config_json=json.dumps(cfg))
+    assert isinstance(policy.current_reasoning_config(None), ProfileReasoningConfig)
+    pin_reasoning_effort(cfg, 'high', session=True)
+    policy = replace(policy, config_json=json.dumps(cfg))
+    assert type(policy.current_reasoning_config(None)) is dict
+
+
+# ── fix 1: an explicit edit survives fallback and primary restoration ─────────
+
+@pytest.mark.parametrize('new_value', [{'enabled': False}, {'enabled': True, 'effort': 'low'}, None, {}])
+def test_edit_during_fallback_survives_restore(new_value):
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'anthropic/claude-sonnet-4'})
+    agent._primary_runtime['reasoning_config'] = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=PROFILE):
+        assert agent._try_activate_fallback()
+        agent.reasoning_config = new_value
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == new_value
+
+
+@pytest.mark.parametrize('reuse_object', [False, True])
+@pytest.mark.parametrize('second_fallback', [False, True])
+def test_equal_assignment_during_fallback_is_a_session_edit(reuse_object, second_fallback):
+    """A fresh value equal to the fallback's own is still a deliberate assignment."""
+    from agent.route_binding import bind_route_entry
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    primary = resolve_reasoning_config({'agent': {'reasoning_effort': 'high'}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    config = {'agent': {'reasoning_effort': 'medium'}}
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=config):
+        assert agent._try_activate_fallback()
+        fresh = agent.reasoning_config if reuse_object else resolve_reasoning_config(config, 'primary')
+        agent.reasoning_config = fresh
+        if second_fallback:
+            assert bind_route_entry(agent, {'provider': 'openrouter', 'model': 'fallback-2'},
+                                    'openrouter', 'fallback-2') is not None
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == fresh
+    assert type(agent.reasoning_config) is type(fresh)
+
+
+def test_reassigning_none_during_fallback_is_a_session_edit():
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    primary = resolve_reasoning_config({'agent': {'reasoning_effort': 'high'}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={}):
+        assert agent._try_activate_fallback()
+        assert agent.reasoning_config is None
+        agent.reasoning_config = None
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config is None
+
+
+def test_unmodified_fallback_restores_primary_profile_provenance():
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'anthropic/claude-sonnet-4'})
+    primary = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
+    agent._primary_runtime['reasoning_config'] = primary
+    agent.reasoning_config = primary
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'medium'}}):
+        assert agent._try_activate_fallback()
+        assert agent.reasoning_config['effort'] == 'medium'
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert isinstance(agent.reasoning_config, ProfileReasoningConfig)
+    assert agent.reasoning_config == primary
+
+
+@pytest.mark.parametrize('fresh', ['medium', 'low', None, 'disabled'])
+def test_cached_gateway_turn_setting_survives_fallback_restoration(fresh):
+    """The gateway re-assigns the turn's own setting on a reused (fallback) agent."""
+    from tests.gateway.test_display_null_turn_wiring import _wire
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    primary = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    config = {'agent': {'reasoning_effort': 'medium'}}
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=config):
+        assert agent._try_activate_fallback()
+        assert agent.reasoning_config['effort'] == 'medium'
+    if fresh == 'disabled':
+        value = {'enabled': False}
+    elif fresh is None:
+        value = None
+    else:
+        value = resolve_reasoning_config({'agent': {'reasoning_effort': fresh}}, 'gpt-6.1-terra')
+    _wire({}, agent=agent, reasoning_config=value)
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == value
+    assert type(agent.reasoning_config) is type(value)
+
+
+@pytest.mark.parametrize('before_fallback', [False, True])
+def test_edit_survives_multiple_fallbacks(before_fallback):
+    from agent.route_binding import bind_route_entry
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'model-a'})
+    agent._primary_runtime['reasoning_config'] = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
+    if before_fallback:
+        agent.reasoning_config = {'enabled': False}
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=PROFILE):
+        assert agent._try_activate_fallback()
+        if not before_fallback:
+            agent.reasoning_config = {'enabled': False}
+        assert bind_route_entry(agent, {'provider': 'openrouter', 'model': 'model-b'},
+                                'openrouter', 'model-b') is not None
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == {'enabled': False}
+
+
+def test_none_edit_between_fallbacks_is_not_replaced_by_fallback_default():
+    from agent.route_binding import bind_route_entry
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'model-a'})
+    agent._primary_runtime['reasoning_config'] = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=PROFILE):
+        assert agent._try_activate_fallback()
+        agent.reasoning_config = None
+        assert bind_route_entry(agent, {'provider': 'openrouter', 'model': 'model-b'},
+                                'openrouter', 'model-b') is not None
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config is None
+
+
+@pytest.mark.parametrize('snapshot_key', [False, True])
+def test_unset_primary_restored_after_real_fallback(snapshot_key):
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    agent.reasoning_config = None
+    if snapshot_key:
+        agent._primary_runtime['reasoning_config'] = None
+    else:
+        agent._primary_runtime.pop('reasoning_config', None)
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'high'}}):
+        assert agent._try_activate_fallback()
+        assert agent.reasoning_config['effort'] == 'high'
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config is None
+
+
+@pytest.mark.parametrize("second_fallback", [False, True])
+def test_in_place_edit_during_fallback_survives_primary_restore(second_fallback):
+    from agent.route_binding import bind_route_entry
+    agent = _make_agent(fallback_model={"provider": "openrouter", "model": "fallback"})
+    primary = resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime["reasoning_config"] = primary
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)), \
+         patch("hermes_cli.config.load_config", return_value={"agent": {"reasoning_effort": "medium"}}):
+        assert agent._try_activate_fallback()
+        agent.reasoning_config["effort"] = "low"
+        if second_fallback:
+            assert bind_route_entry(agent, {"provider": "openrouter", "model": "fallback-2"},
+                                    "openrouter", "fallback-2") is not None
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config["effort"] == "low"
+
+
+def test_empty_switch_snapshot_preserves_explicit_mapping():
+    from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
+    agent = _make_agent()
+    agent.reasoning_config = {}
+    snapshot = _build_primary_runtime_snapshot(agent, agent.api_mode)
+    assert snapshot['reasoning_config'] == {}
+    assert snapshot['reasoning_config'] is not agent.reasoning_config
+
+
+# ── fix 2: model switches resolve from the bound session policy ──────────────
+
+@pytest.mark.parametrize('explicit,expected', [(True, 'low'), (False, 'xhigh')])
+def test_switch_uses_bound_policy_not_process_config(explicit, expected):
+    agent = _make_agent()
+    process = {'agent': {'reasoning_effort': 'high'}}
+    policy = {'agent': {'reasoning_effort': 'medium',
+                        'reasoning_overrides': {'new-model': 'xhigh'}}}
+    agent.reasoning_config = ({'enabled': True, 'effort': 'low'} if explicit
+                              else resolve_reasoning_config(process, 'old-model'))
+    with patch('gateway.session_policy.turn_policy_config', return_value=policy), \
+         patch('hermes_cli.config.load_config', return_value=process), \
+         patch('agent.model_metadata.get_model_context_length', return_value=131072), \
+         patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        agent.switch_model('new-model', 'custom', api_key='sk-test',
+                           base_url='https://my-llm.example.com/v1')
+    assert agent.reasoning_config['effort'] == expected
+
+
+def test_switch_ends_stale_fallback_reasoning_markers():
+    agent = _make_agent()
+    agent._fallback_reasoning_at_bind = {'enabled': True, 'effort': 'medium'}
+    agent._fallback_reasoning_primary = {'enabled': True, 'effort': 'high'}
+    agent._fallback_reasoning_session_edit = ({'enabled': False},)
+    with patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'high'}}), \
+         patch('agent.model_metadata.get_model_context_length', return_value=131072), \
+         patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        agent.switch_model('new-model', 'custom', api_key='sk-test',
+                           base_url='https://my-llm.example.com/v1')
+    assert '_fallback_reasoning_at_bind' not in vars(agent)
+    assert '_fallback_reasoning_primary' not in vars(agent)
+    assert '_fallback_reasoning_session_edit' not in vars(agent)
+    assert agent._primary_runtime['reasoning_config']['effort'] == 'high'
+
+
+@pytest.mark.parametrize('following', [False, True])
+def test_gateway_loader_passes_effective_model_to_local_policy(tmp_path, following):
+    from types import SimpleNamespace
+    from gateway.run_config_loaders import GatewayConfigLoadersMixin
+    config = {'model': {'default': 'model-a', 'provider': 'openrouter'},
+              'agent': {'reasoning_effort': 'medium',
+                        'reasoning_overrides': {'model-a': 'high', 'model-b': 'low'}}}
+    policy = build_policy({'source': 'cli', 'cwd': str(tmp_path), 'model': 'model-a',
+                           'follow_profile_config': following}, config, profile_terminal=False)
+    runner = SimpleNamespace(_resolve_session_key_or_none=lambda *_: 'route',
+                             _peek_session_state=lambda *_: None)
+    with patch('gateway.session_setting_commands.local_policy', return_value=policy), \
+         patch('gateway.session_authorities.active_authority', return_value=None):
+        resolved = GatewayConfigLoadersMixin._resolve_session_reasoning_config(runner, model='model-b')
+    assert resolved['effort'] == 'low'
+
+
+@pytest.mark.parametrize('following', [False, True])
+@pytest.mark.parametrize('pin', [None, 'low'])
+def test_policy_uses_actual_turn_model_not_frozen_model(tmp_path, following, pin):
+    config = {'model': {'default': 'model-a', 'provider': 'openrouter'},
+              'agent': {'reasoning_effort': 'medium',
+                        'reasoning_overrides': {'model-a': 'high', 'model-b': 'xhigh'}}}
+    request = {'source': 'cli', 'cwd': str(tmp_path), 'model': 'model-a',
+               'follow_profile_config': following}
+    if pin:
+        request['reasoning'] = pin
+    policy = build_policy(request, config, profile_terminal=False)
+    with patch('gateway.session_authorities.active_authority', return_value=None):
+        assert policy.current_reasoning_config(None, model='model-a')['effort'] == (pin or 'high')
+        assert policy.current_reasoning_config(None, model='model-b')['effort'] == (pin or 'xhigh')
+        assert policy.current_reasoning_config(None, model='model-a')['effort'] == (pin or 'high')
+
+
+# ── fix 3: a delegated child does not inherit a copied parent policy ─────────
+
+def test_delegated_child_ignores_copied_parent_policy(tmp_path):
+    from agent.delegation_context import delegated_child_context
+    from gateway.session_policy import policy_scope, turn_policy_config
+    parent_cfg = {'agent': {'reasoning_effort': 'high'}}
+    child_cfg = {'agent': {'reasoning_effort': 'medium',
+                           'reasoning_overrides': {'new-model': 'xhigh', 'fallback': 'xhigh'}}}
+    process = {'agent': {'reasoning_effort': 'low'}}
+    request = {'source': 'cli', 'cwd': str(tmp_path)}
+    parent = build_policy(request, parent_cfg, profile_terminal=False)
+    child = build_policy(request, child_cfg, profile_terminal=False)
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    agent.reasoning_config = resolve_reasoning_config(child_cfg, agent.model)
+    with patch('hermes_cli.config.load_config', return_value=process), \
+         patch('agent.model_metadata.get_model_context_length', return_value=131072), \
+         patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         policy_scope(parent):
+        assert turn_policy_config() == parent.config()
+        with delegated_child_context('child'):
+            # The parent's policy was copied into this context, not bound here.
+            assert turn_policy_config() is None
+            with policy_scope(child):
+                assert turn_policy_config() == child.config()
+                agent.reasoning_config = resolve_reasoning_config(child_cfg, agent.model)
+                agent.switch_model('new-model', 'custom', api_key='sk-test',
+                                   base_url='https://my-llm.example.com/v1')
+                assert agent.reasoning_config['effort'] == 'xhigh'
+                assert agent._try_activate_fallback()
+                assert agent.reasoning_config['effort'] == 'xhigh'
+            assert turn_policy_config() is None
+        assert turn_policy_config() == parent.config()
+
+
+def test_delegation_worker_copies_parent_but_accepts_child_binding(tmp_path):
+    from gateway.session_policy import policy_scope, turn_policy_config
+    from tests.tools.test_delegate import _make_mock_parent
+    from tests.tools.test_delegate_child_transcript_release import _fake_child
+    from tools.delegate_tool import _run_single_child
+    cfg = {'agent': {'reasoning_effort': 'high'}}
+    policy = build_policy({'source': 'cli', 'cwd': str(tmp_path)}, cfg, profile_terminal=False)
+    child = _fake_child([])
+    child._delegate_profile_home = None
+    seen = []
+
+    def run_child(**kwargs):
+        seen.append(turn_policy_config())
+        # Even rebinding the very same policy is a new scope owned by this child.
+        with policy_scope(policy):
+            seen.append(turn_policy_config())
+        seen.append(turn_policy_config())
+        return {'final_response': 'ok', 'completed': True, 'api_calls': 1, 'messages': []}
+
+    child.run_conversation.side_effect = run_child
+    with patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'low'}}), \
+         policy_scope(policy):
+        entry = _run_single_child(task_index=0, goal='work', child=child, parent_agent=_make_mock_parent())
+        assert turn_policy_config() == policy.config()
+    assert seen[0] is None
+    assert seen[1] == policy.config()
+    assert seen[2] is None
+    assert entry['summary'] == 'ok'
+
+
+# ── fix 4: voice turns retain and restore explicit edits ─────────────────────
+
+@pytest.mark.parametrize('existing', [False, True])
+def test_voice_route_restores_fallback_tracking(existing):
+    from agent.voice_turn_route import _capture, _reinstall
+    agent = _make_agent()
+    if existing:
+        agent._fallback_reasoning_at_bind = {'enabled': False}
+        agent._fallback_reasoning_primary = None
+    before = {key: value for key, value in vars(agent).items() if key.startswith('_fallback_reasoning_')}
+    state = _capture(agent)
+    agent._fallback_reasoning_at_bind = {'enabled': True}
+    agent._fallback_reasoning_primary = {'effort': 'high'}
+    agent._fallback_reasoning_session_edit = ({},)
+    with patch('agent.route_binding.reinstall_runtime_snapshot'):
+        _reinstall(agent, state)
+    after = {key: value for key, value in vars(agent).items() if key.startswith('_fallback_reasoning_')}
+    assert after == before
+
+
+def test_voice_effort_only_restoration_does_not_create_session_edit():
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    agent = _make_agent()
+    agent._fallback_reasoning_at_bind = {'enabled': True, 'effort': 'medium'}
+    agent.reasoning_config = {'enabled': True, 'effort': 'medium'}
+    agent.__dict__.pop('_fallback_reasoning_session_edit', None)
+    agent._voice_turn_pending = True
+    with patch('agent.auxiliary_task_config._get_auxiliary_task_config', return_value={'reasoning_effort': 'low'}), \
+         patch('agent.voice_turn_route._route_target', return_value=None):
+        begin_voice_turn_route(agent, [], None)
+        end_voice_turn_route(agent)
+    assert '_fallback_reasoning_session_edit' not in vars(agent)
+
+
+@pytest.mark.parametrize("separate_voice", [False, True])
+@pytest.mark.parametrize("edit", [{"enabled": False}, None, {"enabled": True, "effort": "low"}])
+def test_session_edit_during_voice_on_fallback_survives_all_restores(separate_voice, edit):
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    agent = _make_agent(fallback_model={"provider": "openrouter", "model": "fallback"})
+    primary = resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime["reasoning_config"] = primary
+    target = {"provider": "openrouter", "model": "voice"} if separate_voice else None
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)), \
+         patch("hermes_cli.config.load_config", return_value={"agent": {"reasoning_effort": "medium"}}), \
+         patch("agent.auxiliary_task_config._get_auxiliary_task_config", return_value={"reasoning_effort": "none"}), \
+         patch("agent.voice_turn_route._route_target", return_value=target), \
+         patch("agent.voice_turn_route._fits", return_value=True), \
+         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        assert agent._try_activate_fallback()
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [], None)
+        agent.reasoning_config = edit
+        end_voice_turn_route(agent)
+        assert agent.reasoning_config == edit
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == edit
+
+
+@pytest.mark.parametrize("separate_voice", [False, True])
+@pytest.mark.parametrize("mode", ["unchanged", "in_place", "nested_fallback"])
+def test_voice_override_does_not_hide_or_invent_session_edits(separate_voice, mode):
+    from agent.route_binding import bind_route_entry
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    agent = _make_agent(fallback_model={"provider": "openrouter", "model": "fallback"})
+    primary = resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime["reasoning_config"] = primary
+    target = {"provider": "openrouter", "model": "voice"} if separate_voice else None
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)), \
+         patch("hermes_cli.config.load_config", return_value={"agent": {"reasoning_effort": "medium"}}), \
+         patch("agent.auxiliary_task_config._get_auxiliary_task_config", return_value={"reasoning_effort": "low"}), \
+         patch("agent.voice_turn_route._route_target", return_value=target), \
+         patch("agent.voice_turn_route._fits", return_value=True), \
+         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        assert agent._try_activate_fallback()
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [], None)
+        if mode == "in_place":
+            agent.reasoning_config["effort"] = "xhigh"
+        elif mode == "nested_fallback":
+            assert bind_route_entry(agent, {"provider": "openrouter", "model": "voice-fallback"},
+                                    "openrouter", "voice-fallback") is not None
+        end_voice_turn_route(agent)
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config["effort"] == ("xhigh" if mode == "in_place" else "high")
+
+
+@pytest.mark.parametrize("edit", [None, {}, {"enabled": False}, {"enabled": True, "effort": "low"}])
+@pytest.mark.parametrize("mutate", [False, True])
+def test_same_route_voice_edit_without_fallback(edit, mutate):
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    agent = _make_agent()
+    agent.reasoning_config = resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}, agent.model)
+    with patch("agent.auxiliary_task_config._get_auxiliary_task_config", return_value={"reasoning_effort": "low"}), \
+         patch("agent.voice_turn_route._route_target", return_value=None):
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [], None)
+        agent.reasoning_config = edit.copy() if isinstance(edit, dict) else edit
+        if mutate and isinstance(edit, dict):
+            agent.reasoning_config["custom"] = "edited"
+        end_voice_turn_route(agent)
+    expected = {**edit, "custom": "edited"} if mutate and isinstance(edit, dict) else edit
+    assert agent.reasoning_config == expected
+    assert type(agent.reasoning_config) is type(expected)
+
+
+@pytest.mark.parametrize("separate_voice", [False, True])
+@pytest.mark.parametrize("prior_fallback", [False, True])
+def test_voice_assignment_then_in_place_edit_survives_nested_fallback(separate_voice, prior_fallback):
+    from agent.route_binding import bind_route_entry
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    agent = _make_agent(fallback_model={"provider": "openrouter", "model": "fallback"})
+    primary = resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime["reasoning_config"] = primary
+    target = {"provider": "openrouter", "model": "voice"} if separate_voice else None
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)), \
+         patch("hermes_cli.config.load_config", return_value={"agent": {"reasoning_effort": "medium"}}), \
+         patch("agent.auxiliary_task_config._get_auxiliary_task_config", return_value={"reasoning_effort": "low"}), \
+         patch("agent.voice_turn_route._route_target", return_value=target), \
+         patch("agent.voice_turn_route._fits", return_value=True), \
+         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        if prior_fallback:
+            assert agent._try_activate_fallback()
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [], None)
+        agent.reasoning_config = {"enabled": True, "effort": "low"}
+        agent.reasoning_config["effort"] = "xhigh"
+        assert bind_route_entry(agent, {"provider": "openrouter", "model": "voice-fallback"},
+                                "openrouter", "voice-fallback") is not None
+        end_voice_turn_route(agent)
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+        if prior_fallback:
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+
+
+@pytest.mark.parametrize("separate_voice", [False, True])
+@pytest.mark.parametrize("prior_fallback", [False, True])
+@pytest.mark.parametrize("nested_fallback", [False, True])
+@pytest.mark.parametrize("edit_mode", ["none", "assign", "mutate_to_marker"])
+def test_voice_provenance_across_full_primary_restore(separate_voice, prior_fallback, nested_fallback, edit_mode):
+    from agent.route_binding import bind_route_entry
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route, session_runtime_view
+
+    agent = _make_agent(fallback_model={"provider": "openrouter", "model": "fallback"})
+    primary = resolve_reasoning_config({"agent": {"reasoning_effort": "high"}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime["reasoning_config"] = primary
+    target = {"provider": "openrouter", "model": "voice"} if separate_voice else None
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_resolve(), None)), \
+         patch("hermes_cli.config.load_config", return_value={"agent": {"reasoning_effort": "medium"}}), \
+         patch("agent.auxiliary_task_config._get_auxiliary_task_config", return_value={"reasoning_effort": "low"}), \
+         patch("agent.voice_turn_route._route_target", return_value=target), \
+         patch("agent.voice_turn_route._fits", return_value=True), \
+         patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+        if prior_fallback:
+            assert agent._try_activate_fallback()
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [], None)
+        if edit_mode != "none":
+            agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+            if edit_mode == "mutate_to_marker":
+                agent.reasoning_config["effort"] = "low"
+            assert session_runtime_view(agent).reasoning_config == agent.reasoning_config
+        if nested_fallback:
+            assert bind_route_entry(agent, {"provider": "openrouter", "model": "voice-fallback"},
+                                    "openrouter", "voice-fallback") is not None
+            if edit_mode != "none":
+                assert session_runtime_view(agent).reasoning_config["effort"] == (
+                    "low" if edit_mode == "mutate_to_marker" else "xhigh")
+        end_voice_turn_route(agent)
+        if agent._fallback_activated:
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config["effort"] == {
+        "none": "high", "assign": "xhigh", "mutate_to_marker": "low",
+    }[edit_mode]
+
+
+# ── fix 5: an explicit reasoning config needs no capability probe ────────────
+
+def test_explicit_ollama_reasoning_does_not_probe_capabilities():
+    from tests.agent.test_unset_reasoning_effort_default import _Agent
+    from agent.chat_completion_helpers import _reasoning_config_for_wire
+    agent = _Agent(reasoning_config={'enabled': True, 'effort': 'high'})
+    agent.api_mode = 'chat_completions'
+    agent._ollama_num_ctx = 4096
+    agent.reasoning_config = {'enabled': True, 'effort': 'high'}
+    agent._ollama_supports_thinking_cached = MagicMock(side_effect=AssertionError('unexpected probe'))
+    assert _reasoning_config_for_wire(agent) == agent.reasoning_config
+    agent._ollama_supports_thinking_cached.assert_not_called()
