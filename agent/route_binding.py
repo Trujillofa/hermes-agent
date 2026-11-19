@@ -157,8 +157,12 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         provider=provider, base_url=base_url, api_mode=api_mode, model=model)
     agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
     _update_fallback_context_compressor(agent)
-    with internal_reasoning_assignment(agent):
-        _reresolve_fallback_reasoning_config(agent)
+    # A recorded edit is authoritative even when its value is None or happens
+    # to be an unchanged ProfileReasoningConfig. Its snapshot is for restoring;
+    # keep the live value here (it may have been mutated after assignment).
+    if vars(agent).get("_fallback_reasoning_session_edit") is None:
+        with internal_reasoning_assignment(agent):
+            _reresolve_fallback_reasoning_config(agent)
     # Record what the fallback itself installed, not the primary's snapshot. A later
     # session edit must not be overwritten when the primary route comes back.
     agent._fallback_reasoning_at_bind = copy.deepcopy(getattr(agent, "reasoning_config", None))

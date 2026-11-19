@@ -1989,11 +1989,12 @@ def _reresolve_fallback_reasoning_config(agent) -> None:
     Only an untouched profile BASELINE may be replaced by the fallback model's own
     resolution. The signal for "baseline" is the ``ProfileReasoningConfig`` type, and a
     JSON round trip loses it (``dict()``/JSON -> plain ``dict``; ``copy``/``deepcopy``/
-    pickling keep the class and ``is_baseline()``). That asymmetry is deliberate and fails
-    CLOSED: a resumed session restores its stored value as a plain ``dict``, so it is
-    treated as the session's own decision and survives a route change, while a fresh
-    session re-resolves an unedited baseline. Keeping an unknown-provenance value is the
-    safe direction — replacing it is what silently lost explicit edits (#21256 family).
+    pickling keep the class and ``is_baseline()``). A plain dict of unknown provenance
+    is kept rather than silently replacing a possible explicit edit (#21256 family).
+    This does not describe every resume path: gateway policies reconstruct baselines
+    from their stored policy, while legacy local-session adoption converts a stored
+    effort into a session pin. Legacy rows do not record whether the value was a
+    profile baseline or an explicit choice; guessing would risk losing explicit edits.
     """
     from hermes_constants import ProfileReasoningConfig
     current = getattr(agent, "reasoning_config", None)

@@ -202,9 +202,62 @@ def test_none_edit_between_fallbacks_is_not_replaced_by_fallback_default():
         agent.reasoning_config = None
         assert bind_route_entry(agent, {'provider': 'openrouter', 'model': 'model-b'},
                                 'openrouter', 'model-b') is not None
+        assert agent.reasoning_config is None
         with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
             assert agent._restore_primary_runtime()
     assert agent.reasoning_config is None
+
+
+@pytest.mark.parametrize('choice', ['none', 'same-baseline', 'new-baseline', 'in-place'])
+def test_nested_fallback_keeps_explicit_session_edit_on_wire(choice):
+    from agent.route_binding import bind_route_entry
+    from agent.chat_completion_helpers import _reasoning_config_for_wire
+
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'model-a'})
+    config = {'agent': {'reasoning_effort': 'low',
+                        'reasoning_overrides': {'openrouter/model-b': 'high',
+                                                'openrouter/model-c': 'high'}}}
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = resolve_reasoning_config(config, 'primary')
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=config):
+        assert agent._try_activate_fallback()
+        if choice == 'none':
+            agent.reasoning_config = None
+        elif choice == 'same-baseline':
+            agent.reasoning_config = agent.reasoning_config
+        elif choice == 'new-baseline':
+            agent.reasoning_config = resolve_reasoning_config(config, 'primary')
+        else:
+            agent.reasoning_config['effort'] = 'medium'
+        expected = copy.deepcopy(agent.reasoning_config)
+        for model in ('model-b', 'model-c'):
+            assert bind_route_entry(agent, {'provider': 'openrouter', 'model': model}, 'openrouter', model)
+            assert agent.reasoning_config == expected
+            assert type(agent.reasoning_config) is type(expected)
+            wire = _reasoning_config_for_wire(agent)
+            if expected is not None:
+                assert wire == expected
+            else:
+                assert wire is None or wire.get('effort') != 'high'
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == expected
+
+
+def test_unedited_nested_fallback_still_resolves_its_own_profile():
+    from agent.route_binding import bind_route_entry
+    from agent.chat_completion_helpers import _reasoning_config_for_wire
+
+    config = {'agent': {'reasoning_effort': 'low',
+                        'reasoning_overrides': {'openrouter/model-b': 'high'}}}
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'model-a'})
+    agent.reasoning_config = resolve_reasoning_config(config, 'primary')
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=config):
+        assert agent._try_activate_fallback()
+        assert bind_route_entry(agent, {'provider': 'openrouter', 'model': 'model-b'}, 'openrouter', 'model-b')
+        assert agent.reasoning_config['effort'] == 'high'
+        assert _reasoning_config_for_wire(agent)['effort'] == 'high'
 
 
 @pytest.mark.parametrize('snapshot_key', [False, True])
@@ -687,8 +740,8 @@ def test_baseline_class_is_the_fallback_reresolve_signal():
     """Only a profile-baseline object may be re-resolved for a fallback route.
 
     The signal is a Python type, and a JSON round trip loses it. That asymmetry is
-    deliberate and fails CLOSED: a value whose provenance is unknown (a resumed
-    session's stored plain ``dict``) is kept as the session's own decision instead
+    deliberate and fails CLOSED: a value whose provenance is unknown (a JSON
+    round-tripped plain ``dict``) is kept as the session's own decision instead
     of being silently re-derived. Copying preserves the class, so nothing else
     loses the signal.
     """
@@ -718,3 +771,25 @@ def test_baseline_class_is_the_fallback_reresolve_signal():
     resumed_after = after_reresolve(resumed)
     assert resumed_after == resumed
     assert type(resumed_after) is dict
+
+
+def test_legacy_persisted_baseline_and_explicit_choice_are_indistinguishable(tmp_path):
+    """Legacy adoption pins both; it cannot safely infer an unrecorded origin."""
+    from gateway.session_local_migration import legacy_launch_params
+    baseline = resolve_reasoning_config(PROFILE_RERESOLVE, 'primary-model')
+    explicit = dict(baseline)
+    params_list = []
+    for value in (baseline, explicit):
+        row = {'source': 'cli', 'model': 'primary-model', 'cwd': str(tmp_path),
+               'model_config': json.dumps({'reasoning_config': value})}
+        params, _ = legacy_launch_params(row)
+        params_list.append(params)
+        policy = build_policy(params, PROFILE_RERESOLVE, profile_terminal=False)
+        actual = policy.current_reasoning_config(None)
+        assert type(actual) is dict
+        agent = _make_agent()
+        agent.model, agent.provider, agent.reasoning_config = 'fallback-model', 'openrouter', actual
+        with patch('hermes_cli.config.load_config', return_value=PROFILE_RERESOLVE):
+            _reresolve_fallback_reasoning_config(agent)
+        assert agent.reasoning_config == explicit
+    assert params_list[0] == params_list[1]
