@@ -7,12 +7,31 @@ is the inverse that ``restore_primary_runtime`` runs once its gates pass.
 
 from __future__ import annotations
 
+import copy
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
+
+_NO_REASONING_MARKER = object()
+
+
+@contextmanager
+def internal_reasoning_assignment(agent):
+    """Mark route-owned assignments, which must not become session edits."""
+    state = vars(agent)
+    previous = state.get("_internal_reasoning_assignment", _NO_REASONING_MARKER)
+    state["_internal_reasoning_assignment"] = True
+    try:
+        yield
+    finally:
+        if previous is _NO_REASONING_MARKER:
+            state.pop("_internal_reasoning_assignment", None)
+        else:
+            state["_internal_reasoning_assignment"] = previous
 
 
 class RouteEntryClient(NamedTuple):
@@ -92,6 +111,24 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     from agent.route_verdicts import reset_route_verdicts, save_primary_route_verdicts
     save_primary_route_verdicts(agent)  # before the swap: stamped with the endpoint that earned them
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+    # Record what this route's owner (the session, not the fallback) had configured before the swap,
+    # so restoring the primary route cannot resurrect a stale snapshot over a later session edit.
+    prior = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
+    current = getattr(agent, "reasoning_config", None)
+    voice = vars(agent).get("_voice_route_state")
+    if voice and "reasoning_at_bind" in voice:
+        voice["fallback_bound"] = True
+        voice_marker = voice["reasoning_at_bind"]
+        if type(current) is not type(voice_marker) or current != voice_marker:
+            voice["reasoning_session_edit"] = (copy.deepcopy(current),)
+    if prior is _NO_REASONING_MARKER:
+        agent._fallback_reasoning_primary = copy.deepcopy(
+            voice["reasoning_config"] if voice and "reasoning_at_bind" in voice and "snapshot" not in voice
+            else current)
+    elif type(current) is not type(prior) or current != prior:
+        # An in-place edit since this fallback bound: keep it as the session's own value.
+        agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
+
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
     agent._config_context_length = None
@@ -120,7 +157,13 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         provider=provider, base_url=base_url, api_mode=api_mode, model=model)
     agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
     _update_fallback_context_compressor(agent)
-    _reresolve_fallback_reasoning_config(agent)
+    with internal_reasoning_assignment(agent):
+        _reresolve_fallback_reasoning_config(agent)
+    # Record what the fallback itself installed, not the primary's snapshot. A later
+    # session edit must not be overwritten when the primary route comes back.
+    agent._fallback_reasoning_at_bind = copy.deepcopy(getattr(agent, "reasoning_config", None))
+    if voice and "reasoning_at_bind" in voice:
+        voice["reasoning_at_bind"] = copy.deepcopy(agent.reasoning_config)
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     if commit_pool_choice and choice is not None:
         choice.commit()
@@ -161,7 +204,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     # Older snapshots have no reasoning_config; keep the current value.
     saved_reasoning = rt.get("reasoning_config")
     if saved_reasoning is not None:
-        agent.reasoning_config = dict(saved_reasoning)
+        agent.reasoning_config = copy.deepcopy(saved_reasoning)
     # Reset the stale-call circuit breaker: its streak measured the route being left.
     from agent.chat_completion_helpers import _reset_stale_streak, rewrite_prompt_model_identity
     _reset_stale_streak(agent)
@@ -176,7 +219,23 @@ def reinstall_primary_runtime(
 ) -> None:
     """Put ``agent`` back on its ``_primary_runtime`` snapshot ``rt`` and clear the fallback state."""
     from agent.agent_runtime_helpers import _rebind_primary_credential_pool
-    reinstall_runtime_snapshot(agent, rt)
+    marker = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
+    edit = vars(agent).get("_fallback_reasoning_session_edit")
+    current = getattr(agent, "reasoning_config", None)
+    if marker is not _NO_REASONING_MARKER and (type(current) is not type(marker) or current != marker):
+        # A plain attribute assignment or an in-place mutation since the fallback bound.
+        edit = (current,)
+    if edit is None and marker is not _NO_REASONING_MARKER:
+        edit = (vars(agent).get("_fallback_reasoning_primary"),)
+    if edit is not None:
+        current = copy.deepcopy(edit[0])
+    with internal_reasoning_assignment(agent):
+        reinstall_runtime_snapshot(agent, rt)
+        if edit is not None:
+            agent.reasoning_config = current
+    vars(agent).pop("_fallback_reasoning_at_bind", None)
+    vars(agent).pop("_fallback_reasoning_session_edit", None)
+    vars(agent).pop("_fallback_reasoning_primary", None)
     _rebind_primary_credential_pool(
         agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
     )

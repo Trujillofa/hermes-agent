@@ -1985,12 +1985,25 @@ def _update_fallback_context_compressor(agent) -> None:
 def _reresolve_fallback_reasoning_config(agent) -> None:
     """Per-model override > global reasoning_effort (YAML False = disabled); a config load
     failure keeps the current reasoning_config rather than killing the swap."""
+    from hermes_constants import ProfileReasoningConfig
+    current = getattr(agent, "reasoning_config", None)
+    # A caller/session setting is a decision, not a profile baseline the fallback may replace.
+    if current is not None and not (isinstance(current, ProfileReasoningConfig) and current.is_baseline()):
+        return
     try:
         # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
         # because a config load failure must not kill the swap.
         from hermes_cli.config import load_config
         from hermes_constants import resolve_reasoning_config
-        agent.reasoning_config = resolve_reasoning_config(load_config() or {}, agent.model)
+        # The bound session's own config, not the process profile: one gateway process serves
+        # several profiles, and a delegated child must not read its parent's copied policy.
+        try:
+            from gateway.session_policy import turn_policy_config
+            config = turn_policy_config()
+        except Exception:  # health: allow BLE001 -- an unbound/broken policy keeps the process config
+            config = None
+        agent.reasoning_config = resolve_reasoning_config(
+            config if config is not None else (load_config() or {}), agent.model)
         logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
     except Exception as _reasoning_err:
         logger.debug("Failed to resolve reasoning_config for fallback %s; keeping current: %s", agent.model, _reasoning_err)
