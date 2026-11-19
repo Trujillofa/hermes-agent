@@ -348,3 +348,79 @@ def test_enabled_empty_switch_snapshot_preserves_explicit_mapping():
         snapshot = _build_primary_runtime_snapshot(agent, agent.api_mode)
     assert snapshot['reasoning_config'] == {}
     assert snapshot['reasoning_config'] is not agent.reasoning_config
+
+
+@pytest.mark.parametrize('enabled,expected', [(True, 'xhigh'), (False, 'low')])
+def test_fallback_uses_frozen_policy_only_when_enabled(tmp_path, enabled, expected):
+    from gateway.session_policy import policy_scope
+    config = {'agent': {'adaptive_reasoning': enabled, 'reasoning_effort': 'medium',
+                        'reasoning_overrides': {'fallback': 'xhigh'}}}
+    policy = build_policy({'source': 'cli', 'cwd': str(tmp_path)}, config, profile_terminal=False)
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    agent.reasoning_config = resolve_reasoning_config(config, agent.model)
+    with policy_scope(policy), adaptive_turn(agent, 'work', [], None), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'low'}}), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)):
+        assert agent._try_activate_fallback()
+        assert agent.reasoning_config['effort'] == expected
+
+
+def test_child_policy_binding_overrides_copied_parent_for_switch_and_fallback(tmp_path):
+    from agent.adaptive_reasoning import enabled_for_turn
+    from agent.delegation_context import delegated_child_context
+    from gateway.session_policy import policy_scope
+    parent_cfg = {'agent': {'adaptive_reasoning': False, 'reasoning_effort': 'high'}}
+    child_cfg = {'agent': {'adaptive_reasoning': True, 'reasoning_effort': 'medium',
+                           'reasoning_overrides': {'new-model': 'xhigh', 'fallback': 'xhigh'}}}
+    request = {'source': 'cli', 'cwd': str(tmp_path)}
+    parent = build_policy(request, parent_cfg, profile_terminal=False)
+    child = build_policy(request, child_cfg, profile_terminal=False)
+    process = {'agent': {'adaptive_reasoning': False, 'reasoning_effort': 'low'}}
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    agent.reasoning_config = resolve_reasoning_config(child_cfg, agent.model)
+    with patch('hermes_cli.config.load_config', return_value=process), \
+         patch('agent.model_metadata.get_model_context_length', return_value=131072), \
+         patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         policy_scope(parent):
+        with delegated_child_context('child'):
+            assert enabled_for_turn(None) is False  # copied parent is not the child's policy
+            with policy_scope(child):
+                assert enabled_for_turn(None) is True
+                with adaptive_turn(agent, 'work', [], None):
+                    agent.switch_model('new-model', 'custom', api_key='sk-test',
+                                       base_url='https://my-llm.example.com/v1')
+                    assert agent.reasoning_config['effort'] == 'xhigh'
+                    assert agent._try_activate_fallback()
+                    assert agent.reasoning_config['effort'] == 'xhigh'
+            assert enabled_for_turn(None) is False
+        assert enabled_for_turn(None) is False
+
+
+def test_delegation_worker_copies_parent_but_accepts_child_binding(tmp_path):
+    from agent.adaptive_reasoning import enabled_for_turn
+    from gateway.session_policy import policy_scope
+    from tests.tools.test_delegate import _make_mock_parent
+    from tests.tools.test_delegate_child_transcript_release import _fake_child
+    from tools.delegate_tool import _run_single_child
+    cfg = {'agent': {'adaptive_reasoning': True}}
+    policy = build_policy({'source': 'cli', 'cwd': str(tmp_path)}, cfg, profile_terminal=False)
+    child = _fake_child([])
+    child._delegate_profile_home = None
+    seen = []
+
+    def run_child(**kwargs):
+        seen.append(enabled_for_turn(None))
+        # Even rebinding the very same policy is a new scope owned by this child.
+        with policy_scope(policy):
+            seen.append(enabled_for_turn(None))
+        seen.append(enabled_for_turn(None))
+        return {'final_response': 'ok', 'completed': True, 'api_calls': 1, 'messages': []}
+
+    child.run_conversation.side_effect = run_child
+    with patch('hermes_cli.config.load_config', return_value={'agent': {'adaptive_reasoning': False}}), \
+         policy_scope(policy):
+        entry = _run_single_child(task_index=0, goal='work', child=child, parent_agent=_make_mock_parent())
+        assert enabled_for_turn(None) is True
+    assert seen == [False, True, False]
+    assert entry['summary'] == 'ok'

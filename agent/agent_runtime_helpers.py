@@ -2426,14 +2426,11 @@ def switch_model(
     try:
         from hermes_constants import ProfileReasoningConfig, resolve_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
-        from agent.adaptive_reasoning import enabled_for_turn, turn_opt_in
-        from gateway.session_policy import active_policy_config
-        from agent.delegation_context import is_delegated_child_context
+        from agent.adaptive_reasoning import effective_policy_config, enabled_for_turn, turn_opt_in
         turn_enabled = turn_opt_in(agent)
         if turn_enabled is None:
             turn_enabled = enabled_for_turn(None)
-        config = ((active_policy_config() if not is_delegated_child_context() else None)
-                  if turn_enabled else None)
+        config = effective_policy_config() if turn_enabled else None
         config = config if config is not None else (_sm_load_config() or {})
         current = getattr(agent, "reasoning_config", None)
         explicit = current is not None and not (

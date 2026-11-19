@@ -22,6 +22,15 @@ def classify(message, history):
     return None
 
 
+def effective_policy_config():
+    """The current session's policy, excluding a copied delegation parent."""
+    from agent.delegation_context import has_inherited_policy_binding
+    if has_inherited_policy_binding():
+        return None
+    from gateway.session_policy import active_policy_config
+    return active_policy_config()
+
+
 def enabled_for_turn(override):
     """An explicit per-call boolean wins; otherwise use the effective turn policy.
 
@@ -30,11 +39,7 @@ def enabled_for_turn(override):
     if override is not None:
         return override is True
     try:
-        from gateway.session_policy import active_policy_config
-        # A copied parent context is not the child's launch policy. The child
-        # resolves its own (possibly profile-routed) configuration.
-        from agent.delegation_context import is_delegated_child_context
-        config = None if is_delegated_child_context() else active_policy_config()
+        config = effective_policy_config()
         if config is None:
             from hermes_cli.config import load_config
             config = load_config()

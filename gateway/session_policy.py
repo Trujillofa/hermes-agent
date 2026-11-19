@@ -79,6 +79,7 @@ SELECTION_KEYS = ('default', 'provider', 'base_url', 'api_mode', 'selection_prof
                   'api_key_env')
 BYPASS_FIELDS = ('safe_mode', 'ignore_user_config')
 _ACTIVE_POLICY: ContextVar = ContextVar('local_session_policy', default=None)
+_POLICY_BINDING: ContextVar = ContextVar('local_session_policy_binding', default=None)
 _TURN_PROFILE: ContextVar = ContextVar('follow_profile_read', default=None)  # (policy, live) for a turn
 _TURN_POLICY_AUTHORITY: ContextVar = ContextVar('turn_policy_authority', default=None)
 # Creation label -> agent surface. ``tool`` (third-party integrations, ``hermes chat --source tool``) and
@@ -1187,6 +1188,7 @@ def policy_scope(policy, *, authority=None, home=None):
     owner = home if home is not None else getattr(authority, 'profile_id', None)
     terminal_token = bind_terminal_policy(terminal, profile_home=owner)
     policy_token = _ACTIVE_POLICY.set(active)
+    binding_token = _POLICY_BINDING.set(object())
     authority_token = _TURN_POLICY_AUTHORITY.set(authority)
     from gateway.session_local_editor import editor_scope
     try:
@@ -1201,6 +1203,7 @@ def policy_scope(policy, *, authority=None, home=None):
             yield
     finally:
         _TURN_POLICY_AUTHORITY.reset(authority_token)
+        _POLICY_BINDING.reset(binding_token)
         _ACTIVE_POLICY.reset(policy_token)
         reset_terminal_scope(terminal_token)
         cwd_token.var.reset(cwd_token)
@@ -1286,6 +1289,11 @@ def active_policy():
     """The frozen launch policy of the turn executing in this context, or ``None`` (standalone
     serve / messaging turns). Consumers read it instead of re-deriving from live config."""
     return _ACTIVE_POLICY.get()
+
+
+def active_policy_binding():
+    """Identity of this policy scope, including rebindings of the same policy."""
+    return _POLICY_BINDING.get()
 
 
 def active_policy_config():
