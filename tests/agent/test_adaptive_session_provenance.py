@@ -275,3 +275,76 @@ def test_voice_route_restores_fallback_tracking(existing):
         _reinstall(agent, state)
     after = {key: value for key, value in vars(agent).items() if key.startswith('_fallback_reasoning_')}
     assert after == before
+
+
+@pytest.mark.parametrize('override,process_enabled,policy_enabled,explicit,expected', [
+    (True, False, False, True, 'low'),
+    (False, True, True, True, 'high'),
+    (None, False, True, True, 'low'),
+    (None, False, True, False, 'xhigh'),
+])
+def test_switch_uses_bound_policy_and_per_call_override(override, process_enabled, policy_enabled, explicit, expected):
+    agent = _make_agent()
+    process = {'agent': {'adaptive_reasoning': process_enabled, 'reasoning_effort': 'high'}}
+    policy = {'agent': {'adaptive_reasoning': policy_enabled, 'reasoning_effort': 'medium',
+                        'reasoning_overrides': {'new-model': 'xhigh'}}}
+    agent.reasoning_config = ({'enabled': True, 'effort': 'low'} if explicit
+                              else resolve_reasoning_config(policy, 'old-model'))
+    with patch('gateway.session_policy.active_policy_config', return_value=policy), \
+         patch('hermes_cli.config.load_config', return_value=process), \
+         patch('agent.model_metadata.get_model_context_length', return_value=131072), \
+         patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()), \
+         adaptive_turn(agent, 'work', [], override):
+        agent.switch_model('new-model', 'custom', api_key='sk-test',
+                           base_url='https://my-llm.example.com/v1')
+    assert agent.reasoning_config['effort'] == expected
+
+
+def test_disabled_empty_switch_snapshot_keeps_fallback_legacy_behavior():
+    from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    agent.reasoning_config = {}
+    agent._primary_runtime = _build_primary_runtime_snapshot(agent, agent.api_mode)
+    assert agent._primary_runtime['reasoning_config'] is None
+    with adaptive_turn(agent, 'work', [], False), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'medium'}}):
+        assert agent._try_activate_fallback()
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config['effort'] == 'medium'
+
+
+@pytest.mark.parametrize('parent_enabled,child_enabled', [(True, False), (False, True)])
+def test_delegated_child_resolves_own_opt_in(parent_enabled, child_enabled):
+    from agent.adaptive_reasoning import enabled_for_turn
+    from agent.delegation_context import delegated_child_context
+    with patch('gateway.session_policy.active_policy_config', return_value={'agent': {'adaptive_reasoning': parent_enabled}}), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'adaptive_reasoning': child_enabled}}):
+        assert enabled_for_turn(None) is parent_enabled
+        with delegated_child_context('child'):
+            assert enabled_for_turn(None) is child_enabled
+        assert enabled_for_turn(None) is parent_enabled
+
+
+def test_disabled_explicit_ollama_does_not_probe_capabilities():
+    from tests.agent.test_unset_reasoning_effort_default import _Agent
+    from agent.chat_completion_helpers import _reasoning_config_for_wire
+    agent = _Agent(reasoning_config={'enabled': True, 'effort': 'high'})
+    agent.api_mode = 'chat_completions'
+    agent._ollama_num_ctx = 4096
+    agent.reasoning_config = {'enabled': True, 'effort': 'high'}
+    agent._ollama_supports_thinking_cached = MagicMock(side_effect=AssertionError('unexpected probe'))
+    with adaptive_turn(agent, 'work', [], False):
+        assert _reasoning_config_for_wire(agent) == agent.reasoning_config
+    agent._ollama_supports_thinking_cached.assert_not_called()
+
+
+def test_enabled_empty_switch_snapshot_preserves_explicit_mapping():
+    from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
+    agent = _make_agent()
+    agent.reasoning_config = {}
+    with adaptive_turn(agent, 'work', [], True):
+        snapshot = _build_primary_runtime_snapshot(agent, agent.api_mode)
+    assert snapshot['reasoning_config'] == {}
+    assert snapshot['reasoning_config'] is not agent.reasoning_config

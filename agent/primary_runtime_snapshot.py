@@ -50,6 +50,10 @@ def _snapshot_primary_runtime(agent):
 def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
     """The ``_primary_runtime`` record that persists a switch across turns."""
     cc = getattr(agent, "context_compressor", None) or None
+    from agent.adaptive_reasoning import active_for_agent
+    reasoning = getattr(agent, "reasoning_config", None)
+    if not active_for_agent(agent) and not reasoning:
+        reasoning = None  # Legacy switch snapshots did not retain an empty mapping.
     rt = {
         "model": agent.model,
         "provider": agent.provider,
@@ -61,7 +65,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
-        "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
+        "reasoning_config": copy.deepcopy(reasoning),
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         # Overrides must travel with the switched-to identity or a later recovery/restore resurrects
         # PRE-switch overrides from the stale init snapshot.

@@ -2426,11 +2426,19 @@ def switch_model(
     try:
         from hermes_constants import ProfileReasoningConfig, resolve_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
-        config = _sm_load_config() or {}
+        from agent.adaptive_reasoning import enabled_for_turn, turn_opt_in
+        from gateway.session_policy import active_policy_config
+        from agent.delegation_context import is_delegated_child_context
+        turn_enabled = turn_opt_in(agent)
+        if turn_enabled is None:
+            turn_enabled = enabled_for_turn(None)
+        config = ((active_policy_config() if not is_delegated_child_context() else None)
+                  if turn_enabled else None)
+        config = config if config is not None else (_sm_load_config() or {})
         current = getattr(agent, "reasoning_config", None)
         explicit = current is not None and not (
             isinstance(current, ProfileReasoningConfig) and current.is_baseline())
-        if not (config.get("agent", {}).get("adaptive_reasoning") is True and explicit):
+        if not (turn_enabled and explicit):
             agent.reasoning_config = resolve_reasoning_config(config, agent.model)
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config

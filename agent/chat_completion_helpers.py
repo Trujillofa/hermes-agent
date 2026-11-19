@@ -1311,8 +1311,9 @@ def _reasoning_config_for_wire(agent, messages=None):
         from agent.reasoning_params import unset_reasoning_default
         cfg = unset_reasoning_default(agent)
     # Codex Responses has its own default rather than an unset chat default.
+    from agent.adaptive_reasoning import active_for_agent
     from agent.reasoning_params import unset_reasoning_default
-    if ((getattr(agent, "api_mode", None) == "chat_completions" and unset_reasoning_default(agent) is not None)
+    if active_for_agent(agent) and ((getattr(agent, "api_mode", None) == "chat_completions" and unset_reasoning_default(agent) is not None)
             or (getattr(agent, "api_mode", None) == "codex_responses"
                 and getattr(agent, "provider", None) == "openai-codex")):
         from agent.adaptive_reasoning import reasoning_for_turn

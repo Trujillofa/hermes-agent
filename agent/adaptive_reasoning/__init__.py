@@ -31,7 +31,10 @@ def enabled_for_turn(override):
         return override is True
     try:
         from gateway.session_policy import active_policy_config
-        config = active_policy_config()
+        # A copied parent context is not the child's launch policy. The child
+        # resolves its own (possibly profile-routed) configuration.
+        from agent.delegation_context import is_delegated_child_context
+        config = None if is_delegated_child_context() else active_policy_config()
         if config is None:
             from hermes_cli.config import load_config
             config = load_config()
@@ -54,6 +57,12 @@ def adaptive_turn(agent, message, history, enabled, *, suppress_decision=False):
         yield
     finally:
         _turn.reset(token)
+
+
+def turn_opt_in(agent):
+    """Return the bound per-call decision, or None outside this agent's turn."""
+    turn = _turn.get()
+    return turn[2] if turn and turn[0] is agent else None
 
 
 def active_for_agent(agent):
