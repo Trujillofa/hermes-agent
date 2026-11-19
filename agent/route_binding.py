@@ -116,11 +116,14 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         current = getattr(agent, "reasoning_config", None)
         voice = vars(agent).get("_voice_route_state")
         if voice and "reasoning_at_bind" in voice:
+            voice["fallback_bound"] = True
             voice_marker = voice["reasoning_at_bind"]
             if type(current) is not type(voice_marker) or current != voice_marker:
                 voice["reasoning_session_edit"] = (copy.deepcopy(current),)
         if prior is _NO_REASONING_MARKER:
-            agent._fallback_reasoning_primary = copy.deepcopy(current)
+            agent._fallback_reasoning_primary = copy.deepcopy(
+                voice["reasoning_config"] if voice and "reasoning_at_bind" in voice and "snapshot" not in voice
+                else current)
         elif type(current) is not type(prior) or current != prior:
             agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
 

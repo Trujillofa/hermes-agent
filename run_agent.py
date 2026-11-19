@@ -236,11 +236,12 @@ class AIAgent(
         if (not self.__dict__.get("_internal_reasoning_assignment", False)
                 and ("_fallback_reasoning_at_bind" in self.__dict__
                      or (voice is not None and voice.get("track_reasoning")))):
-            import copy
+            # Keep the assigned object until the next route boundary so subsequent
+            # in-place edits, including a return to the bind value, are retained.
             if "_fallback_reasoning_at_bind" in self.__dict__:
-                self._fallback_reasoning_session_edit = (copy.deepcopy(value),)
+                self._fallback_reasoning_session_edit = (value,)
             if voice is not None and voice.get("track_reasoning"):
-                voice["reasoning_session_edit"] = (copy.deepcopy(value),)
+                voice["reasoning_session_edit"] = (value,)
         self.__dict__["reasoning_config"] = value
 
     @property

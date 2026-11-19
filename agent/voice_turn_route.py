@@ -219,7 +219,12 @@ class _SessionRuntimeView:
                ("model", "provider", "requested_provider", "base_url", "api_mode") if name in snapshot}
         if "anthropic_base_url" in snapshot:
             own["_anthropic_base_url"] = snapshot["anthropic_base_url"]
-        own["reasoning_config"] = state.get("reasoning_config")
+        edit = state.get("reasoning_session_edit")
+        current = getattr(agent, "reasoning_config", None)
+        marker = state.get("reasoning_at_bind", _MISSING)
+        if marker is not _MISSING and (type(current) is not type(marker) or current != marker):
+            edit = (current,)
+        own["reasoning_config"] = edit[0] if edit is not None else state.get("reasoning_config")
         self.__dict__.update(_agent=agent, _own=own)
 
     def __getattr__(self, name: str) -> Any:
@@ -254,7 +259,7 @@ def end_voice_turn_route(agent: Any) -> None:
                 from agent.auxiliary_reasoning_floor import remember_reasoning_floor
                 remember_reasoning_floor(agent.provider, agent.base_url, {"model": agent.model}, None)
             _reinstall(agent, state)
-        else:
+        elif not state.get("fallback_bound"):
             _restore_reasoning_markers(agent, state)
     except Exception:
         logger.warning("Voice turn route restore failed; the next turn re-resolves the main runtime",
@@ -265,3 +270,5 @@ def end_voice_turn_route(agent: Any) -> None:
         agent._fallback_reasoning_session_edit = copy.deepcopy(edit)
     with internal_reasoning_assignment(agent):
         agent.reasoning_config = copy.deepcopy(edit[0] if edit is not None else state["reasoning_config"])
+    if "snapshot" not in state and state.get("fallback_bound") and "_fallback_reasoning_at_bind" in vars(agent):
+        agent._fallback_reasoning_at_bind = copy.deepcopy(agent.reasoning_config)
