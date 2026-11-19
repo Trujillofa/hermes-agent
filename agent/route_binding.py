@@ -116,6 +116,8 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         current = getattr(agent, "reasoning_config", None)
         if prior is _NO_REASONING_MARKER:
             agent._fallback_reasoning_primary = copy.deepcopy(current)
+        elif type(current) is not type(prior) or current != prior:
+            agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
 
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
@@ -208,6 +210,9 @@ def reinstall_primary_runtime(
     from agent.agent_runtime_helpers import _rebind_primary_credential_pool
     marker = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
     edit = vars(agent).get("_fallback_reasoning_session_edit")
+    current = getattr(agent, "reasoning_config", None)
+    if marker is not _NO_REASONING_MARKER and (type(current) is not type(marker) or current != marker):
+        edit = (current,)
     if edit is None and marker is not _NO_REASONING_MARKER:
         edit = (vars(agent).get("_fallback_reasoning_primary"),)
     if edit is not None:
