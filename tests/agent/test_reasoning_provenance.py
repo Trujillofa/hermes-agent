@@ -11,10 +11,17 @@ choice:
 * a delegated child inherited the parent's copied policy instead of using its
   own (or its process config);
 * a voice turn's effort override hid the session's edit, and a fallback that
-  activated during the voice turn restored over it.
+  activated during the voice turn restored over it;
+* the gateway's per-turn reasoning assignment recorded the caller's live dict as
+  the session edit, so a later in-place mutation rewrote the record (the setter
+  now snapshots it, and the runner's dead pre-write is gone);
+* a primary-runtime restore with no fallback markers (a one-turn ``/model --once``
+  restore, an init-time fallback) let the snapshot's older value overwrite the
+  session's own choice.
 
 The fixes are unconditional: no feature flag, no classifier.
 """
+import copy
 import json
 from dataclasses import replace
 from unittest.mock import MagicMock, patch
@@ -566,3 +573,148 @@ def test_explicit_ollama_reasoning_does_not_probe_capabilities():
     agent._ollama_supports_thinking_cached = MagicMock(side_effect=AssertionError('unexpected probe'))
     assert _reasoning_config_for_wire(agent) == agent.reasoning_config
     agent._ollama_supports_thinking_cached.assert_not_called()
+
+
+# ── fix 6: the recorded session edit is a snapshot, not the caller's object ──
+
+@pytest.mark.parametrize('value', [{'enabled': True, 'effort': 'high'}, {}, None])
+def test_reasoning_setter_records_a_snapshot_of_the_assigned_value(value):
+    """The setter is the single place a fallback-bound agent records a session edit."""
+    agent = _make_agent()
+    agent._fallback_reasoning_at_bind = {'enabled': True, 'effort': 'medium'}
+    agent.reasoning_config = value
+    recorded = agent._fallback_reasoning_session_edit[0]
+    assert recorded == value
+    assert recorded is not value or value is None
+    if isinstance(value, dict):
+        value['custom'] = 'mutated by the caller'
+    assert agent._fallback_reasoning_session_edit[0] == recorded
+
+
+def test_gateway_turn_assignment_records_a_snapshot_not_the_turn_dict():
+    """``run_turn_runner`` hands the setter the turn's live policy dict every turn.
+
+    The runner used to pre-write the marker and then have the setter overwrite it
+    with that live dict, so mutating the turn's policy rewrote the recorded edit.
+    """
+    from tests.gateway.test_display_null_turn_wiring import _wire
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    primary = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=PROFILE):
+        assert agent._try_activate_fallback()
+    turn = {'enabled': True, 'effort': 'high'}
+    _wire({}, agent=agent, reasoning_config=turn)
+    recorded = agent._fallback_reasoning_session_edit
+    assert recorded is not None
+    assert recorded[0] == turn
+    assert recorded[0] is not turn
+    turn['effort'] = 'low'
+    assert recorded[0] == {'enabled': True, 'effort': 'high'}
+
+
+# ── fix 7: a missing provenance marker must not resurrect the snapshot ───────
+
+def _activate_fallback_with_markers(agent, *, keep_markers):
+    """Bind a fallback, then optionally drop the markers while it stays active."""
+    primary = resolve_reasoning_config({'agent': {'reasoning_effort': 'medium'}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    with patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={'agent': {'reasoning_effort': 'medium'}}):
+        assert agent._try_activate_fallback()
+    if not keep_markers:
+        for name in ('_fallback_reasoning_at_bind', '_fallback_reasoning_primary',
+                     '_fallback_reasoning_session_edit'):
+            vars(agent).pop(name, None)
+
+
+@pytest.mark.parametrize('keep_markers', [False, True])
+def test_turn_choice_survives_restore_without_provenance_markers(keep_markers):
+    """Init-time fallbacks and end-of-voice marker restores leave no markers."""
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    _activate_fallback_with_markers(agent, keep_markers=keep_markers)
+    choice = resolve_reasoning_config({'agent': {'reasoning_effort': 'high'}}, 'gpt-6.1-terra')
+    agent.reasoning_config = choice
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == choice
+    assert type(agent.reasoning_config) is type(choice)
+
+
+def test_restore_without_markers_keeps_an_unchanged_session_value():
+    """No markers, and the value already matches the snapshot: nothing to protect."""
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    _activate_fallback_with_markers(agent, keep_markers=False)
+    saved = agent._primary_runtime['reasoning_config']
+    agent.reasoning_config = copy.deepcopy(saved)
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == saved
+
+
+def test_one_turn_model_override_restore_keeps_pre_override_reasoning():
+    """Reachable production path: the ``/model ... --once`` restore.
+
+    ``hermes_cli.cli_model_switch_mixin._restore_model_runtime_snapshot`` assigns the
+    session's pre-override ``reasoning_config`` and THEN forces ``_fallback_activated``
+    with an older ``_primary_runtime`` and no fallback markers — a one-turn override never
+    binds through ``bind_route_entry``. Its TUI twin (``tui_gateway/model_switch.py``)
+    re-assigns the value after a successful restore to paper over this clobber.
+    """
+    agent = _make_agent()
+    stale = resolve_reasoning_config({'agent': {'reasoning_effort': 'medium'}}, agent.model)
+    session = {'enabled': True, 'effort': 'high'}
+    assert stale != session
+    agent._primary_runtime['reasoning_config'] = stale
+    agent.reasoning_config = session             # pre-restore assignment, as the CLI does
+    agent._fallback_activated = True             # forced by the one-turn restore
+    assert not any(name in vars(agent) for name in
+                   ('_fallback_reasoning_at_bind', '_fallback_reasoning_primary',
+                    '_fallback_reasoning_session_edit'))
+    with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+        assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == session
+
+
+# ── provenance class: conservative by design, documented here ───────────────
+
+PROFILE_RERESOLVE = {'agent': {'reasoning_effort': 'medium',
+                               'reasoning_overrides': {'openrouter/fallback-model': 'low'}}}
+
+
+def test_baseline_class_is_the_fallback_reresolve_signal():
+    """Only a profile-baseline object may be re-resolved for a fallback route.
+
+    The signal is a Python type, and a JSON round trip loses it. That asymmetry is
+    deliberate and fails CLOSED: a value whose provenance is unknown (a resumed
+    session's stored plain ``dict``) is kept as the session's own decision instead
+    of being silently re-derived. Copying preserves the class, so nothing else
+    loses the signal.
+    """
+    fresh = resolve_reasoning_config(PROFILE_RERESOLVE, 'primary-model')
+    resumed = json.loads(json.dumps(fresh))
+    assert type(fresh) is ProfileReasoningConfig
+
+    assert type(resumed) is dict
+    assert resumed == fresh
+    for clone in (copy.deepcopy(fresh), copy.copy(fresh)):
+        assert type(clone) is ProfileReasoningConfig
+        assert clone.is_baseline()
+
+    def after_reresolve(value):
+        agent = _make_agent()
+        agent.model, agent.provider = 'fallback-model', 'openrouter'
+        agent.reasoning_config = value
+        with patch('hermes_cli.config.load_config', return_value=PROFILE_RERESOLVE):
+            _reresolve_fallback_reasoning_config(agent)
+        return agent.reasoning_config
+
+    fresh_after = after_reresolve(fresh)
+    assert fresh_after['effort'] == 'low'
+    assert type(fresh_after) is ProfileReasoningConfig
+    # A plain dict is the session's value: never replaced, and never upgraded to
+    # the baseline class (which would let the NEXT route change replace it).
+    resumed_after = after_reresolve(resumed)
+    assert resumed_after == resumed
+    assert type(resumed_after) is dict

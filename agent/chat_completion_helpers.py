@@ -1984,7 +1984,17 @@ def _update_fallback_context_compressor(agent) -> None:
 
 def _reresolve_fallback_reasoning_config(agent) -> None:
     """Per-model override > global reasoning_effort (YAML False = disabled); a config load
-    failure keeps the current reasoning_config rather than killing the swap."""
+    failure keeps the current reasoning_config rather than killing the swap.
+
+    Only an untouched profile BASELINE may be replaced by the fallback model's own
+    resolution. The signal for "baseline" is the ``ProfileReasoningConfig`` type, and a
+    JSON round trip loses it (``dict()``/JSON -> plain ``dict``; ``copy``/``deepcopy``/
+    pickling keep the class and ``is_baseline()``). That asymmetry is deliberate and fails
+    CLOSED: a resumed session restores its stored value as a plain ``dict``, so it is
+    treated as the session's own decision and survives a route change, while a fresh
+    session re-resolves an unedited baseline. Keeping an unknown-provenance value is the
+    safe direction — replacing it is what silently lost explicit edits (#21256 family).
+    """
     from hermes_constants import ProfileReasoningConfig
     current = getattr(agent, "reasoning_config", None)
     # A caller/session setting is a decision, not a profile baseline the fallback may replace.

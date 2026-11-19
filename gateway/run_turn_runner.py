@@ -555,11 +555,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         agent.notice_clear_callback = self._local_notice_clear_callback_sync if local_viewer_turn(self) else None
         agent.event_callback = ctx._event_callback_sync
         # A cached fallback can coincidentally have the same value as this freshly
-        # resolved turn setting. Record the assignment's provenance, not just a
-        # value comparison, so restoring primary cannot resurrect its old snapshot.
-        if "_fallback_reasoning_at_bind" in vars(agent):
-            from copy import deepcopy
-            agent._fallback_reasoning_session_edit = (deepcopy(reasoning_config),)
+        # resolved turn setting. The reasoning_config setter records the assignment's
+        # provenance (a deep-copied snapshot) itself, so restoring primary cannot
+        # resurrect its old snapshot — do not pre-write the marker here: the setter
+        # runs on the very next line and would replace it with the caller's live object.
         agent.reasoning_config, agent.service_tier = reasoning_config, turn_route.get("service_tier")
         _load_daybreak = getattr(runner, "_load_daybreak", None)  # absent on minimal test runners
         agent.daybreak = callable(_load_daybreak) and _load_daybreak(ctx.source) is True

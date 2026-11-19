@@ -220,13 +220,28 @@ def reinstall_primary_runtime(
     """Put ``agent`` back on its ``_primary_runtime`` snapshot ``rt`` and clear the fallback state."""
     from agent.agent_runtime_helpers import _rebind_primary_credential_pool
     marker = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
+    marker_present = marker is not _NO_REASONING_MARKER
     edit = vars(agent).get("_fallback_reasoning_session_edit")
     current = getattr(agent, "reasoning_config", None)
-    if marker is not _NO_REASONING_MARKER and (type(current) is not type(marker) or current != marker):
+    if marker_present and (type(current) is not type(marker) or current != marker):
         # A plain attribute assignment or an in-place mutation since the fallback bound.
         edit = (current,)
-    if edit is None and marker is not _NO_REASONING_MARKER:
+    if edit is None and marker_present:
         edit = (vars(agent).get("_fallback_reasoning_primary"),)
+    if edit is None and not marker_present:
+        # Zero trust: the markers are the only record that a value was installed by a
+        # fallback rather than chosen by the session, and ``_fallback_activated`` can be set
+        # without them — a one-turn ``/model ... --once`` restore forces it around a
+        # ``_primary_runtime`` snapshot that predates a session ``/reasoning`` change
+        # (cli_model_switch_mixin._restore_model_runtime_snapshot), and an init-time fallback
+        # activation never binds through ``bind_route_entry``. A differing current value is
+        # then indistinguishable from a session edit, so keep it instead of resurrecting the
+        # snapshot's older value. (The voice route is NOT such a source: it restores
+        # ``_fallback_activated`` alongside the markers.) Only a value the snapshot would
+        # actually overwrite needs this; an absent snapshot key already leaves the current value.
+        saved = rt.get("reasoning_config")
+        if saved is not None and (type(current) is not type(saved) or current != saved):
+            edit = (current,)
     if edit is not None:
         current = copy.deepcopy(edit[0])
     with internal_reasoning_assignment(agent):
