@@ -9,11 +9,27 @@ from __future__ import annotations
 
 import copy
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def internal_reasoning_assignment(agent):
+    """Mark route-owned assignments, which must not become session edits."""
+    state = vars(agent)
+    previous = state.get("_internal_reasoning_assignment", _NO_REASONING_MARKER)
+    state["_internal_reasoning_assignment"] = True
+    try:
+        yield
+    finally:
+        if previous is _NO_REASONING_MARKER:
+            state.pop("_internal_reasoning_assignment", None)
+        else:
+            state["_internal_reasoning_assignment"] = previous
 
 
 class RouteEntryClient(NamedTuple):
@@ -100,8 +116,7 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         current = getattr(agent, "reasoning_config", None)
         if prior is _NO_REASONING_MARKER:
             agent._fallback_reasoning_primary = copy.deepcopy(current)
-        elif type(current) is not type(prior) or current != prior:
-            agent._fallback_reasoning_session_edit = (copy.deepcopy(current),)
+
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
     agent._config_context_length = None
@@ -130,7 +145,8 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         provider=provider, base_url=base_url, api_mode=api_mode, model=model)
     agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
     _update_fallback_context_compressor(agent)
-    _reresolve_fallback_reasoning_config(agent)
+    with internal_reasoning_assignment(agent):
+        _reresolve_fallback_reasoning_config(agent)
     # Record what the fallback itself installed, not the primary's snapshot. A later
     # session edit must not be overwritten when the primary route comes back.
     if track_reasoning:
@@ -191,16 +207,15 @@ def reinstall_primary_runtime(
     """Put ``agent`` back on its ``_primary_runtime`` snapshot ``rt`` and clear the fallback state."""
     from agent.agent_runtime_helpers import _rebind_primary_credential_pool
     marker = vars(agent).get("_fallback_reasoning_at_bind", _NO_REASONING_MARKER)
-    current = getattr(agent, "reasoning_config", None)
-    changed = marker is not _NO_REASONING_MARKER and (type(current) is not type(marker) or current != marker)
-    edit = (current,) if changed else vars(agent).get("_fallback_reasoning_session_edit")
+    edit = vars(agent).get("_fallback_reasoning_session_edit")
     if edit is None and marker is not _NO_REASONING_MARKER:
         edit = (vars(agent).get("_fallback_reasoning_primary"),)
     if edit is not None:
         current = copy.deepcopy(edit[0])
-    reinstall_runtime_snapshot(agent, rt)
-    if edit is not None:
-        agent.reasoning_config = current
+    with internal_reasoning_assignment(agent):
+        reinstall_runtime_snapshot(agent, rt)
+        if edit is not None:
+            agent.reasoning_config = current
     vars(agent).pop("_fallback_reasoning_at_bind", None)
     vars(agent).pop("_fallback_reasoning_session_edit", None)
     vars(agent).pop("_fallback_reasoning_primary", None)

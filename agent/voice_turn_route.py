@@ -178,7 +178,9 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
         agent._turn_route_task = TASK
         logger.info("Voice turn routed to %s (%s)", agent.model, agent.provider)
     if effort is not None:
-        agent.reasoning_config = _voice_reasoning(agent, effort)
+        from agent.route_binding import internal_reasoning_assignment
+        with internal_reasoning_assignment(agent):
+            agent.reasoning_config = _voice_reasoning(agent, effort)
     return agent._cached_system_prompt or system_prompt
 
 
@@ -225,4 +227,6 @@ def end_voice_turn_route(agent: Any) -> None:
         logger.warning("Voice turn route restore failed; the next turn re-resolves the main runtime",
                        exc_info=True)
         agent._fallback_activated = True  # restore_primary_runtime takes it from here
-    agent.reasoning_config = state["reasoning_config"]
+    from agent.route_binding import internal_reasoning_assignment
+    with internal_reasoning_assignment(agent):
+        agent.reasoning_config = state["reasoning_config"]

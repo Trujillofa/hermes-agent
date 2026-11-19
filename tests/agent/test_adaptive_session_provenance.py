@@ -66,6 +66,44 @@ def test_edit_during_fallback_survives_restore(new_value):
     assert agent.reasoning_config == new_value
 
 
+@pytest.mark.parametrize('reuse_object', [False, True])
+@pytest.mark.parametrize('second_fallback', [False, True])
+def test_equal_assignment_during_fallback_is_a_session_edit(reuse_object, second_fallback):
+    from agent.route_binding import bind_route_entry
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    primary = resolve_reasoning_config({'agent': {'reasoning_effort': 'high'}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    config = {'agent': {'reasoning_effort': 'medium'}}
+    with adaptive_turn(agent, 'work', [], True), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value=config):
+        assert agent._try_activate_fallback()
+        fresh = agent.reasoning_config if reuse_object else resolve_reasoning_config(config, 'primary')
+        agent.reasoning_config = fresh
+        if second_fallback:
+            assert bind_route_entry(agent, {'provider': 'openrouter', 'model': 'fallback-2'},
+                                    'openrouter', 'fallback-2') is not None
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config == fresh
+    assert type(agent.reasoning_config) is type(fresh)
+
+
+def test_reassigning_none_during_fallback_is_a_session_edit():
+    agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'fallback'})
+    primary = resolve_reasoning_config({'agent': {'reasoning_effort': 'high'}}, agent.model)
+    agent.reasoning_config = agent._primary_runtime['reasoning_config'] = primary
+    with adaptive_turn(agent, 'work', [], True), \
+         patch('agent.auxiliary_client.resolve_provider_client', return_value=(_mock_resolve(), None)), \
+         patch('hermes_cli.config.load_config', return_value={}):
+        assert agent._try_activate_fallback()
+        assert agent.reasoning_config is None
+        agent.reasoning_config = None
+        with patch('agent.process_bootstrap.OpenAI', return_value=MagicMock()):
+            assert agent._restore_primary_runtime()
+    assert agent.reasoning_config is None
+
+
 def test_unmodified_fallback_restores_primary_profile_provenance():
     agent = _make_agent(fallback_model={'provider': 'openrouter', 'model': 'anthropic/claude-sonnet-4'})
     primary = resolve_reasoning_config(PROFILE, 'gpt-6.1-terra')
@@ -275,6 +313,20 @@ def test_voice_route_restores_fallback_tracking(existing):
         _reinstall(agent, state)
     after = {key: value for key, value in vars(agent).items() if key.startswith('_fallback_reasoning_')}
     assert after == before
+
+
+def test_voice_effort_only_restoration_does_not_create_session_edit():
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    agent = _make_agent()
+    agent._fallback_reasoning_at_bind = {'enabled': True, 'effort': 'medium'}
+    agent.reasoning_config = {'enabled': True, 'effort': 'medium'}
+    agent.__dict__.pop('_fallback_reasoning_session_edit')
+    agent._voice_turn_pending = True
+    with patch('agent.auxiliary_task_config._get_auxiliary_task_config', return_value={'reasoning_effort': 'low'}), \
+         patch('agent.voice_turn_route._route_target', return_value=None):
+        begin_voice_turn_route(agent, [], None)
+        end_voice_turn_route(agent)
+    assert '_fallback_reasoning_session_edit' not in vars(agent)
 
 
 @pytest.mark.parametrize('override,process_enabled,policy_enabled,explicit,expected', [

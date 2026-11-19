@@ -225,6 +225,20 @@ class AIAgent(
     )
 
     @property
+    def reasoning_config(self):
+        return self.__dict__.get("reasoning_config")
+
+    @reasoning_config.setter
+    def reasoning_config(self, value):
+        # Reassignment is the supported session edit, including equal values and
+        # None. In-place dict mutation cannot identify the author's intent.
+        if ("_fallback_reasoning_at_bind" in self.__dict__
+                and not self.__dict__.get("_internal_reasoning_assignment", False)):
+            import copy
+            self._fallback_reasoning_session_edit = (copy.deepcopy(value),)
+        self.__dict__["reasoning_config"] = value
+
+    @property
     def base_url(self) -> str:
         return self._base_url
 
